@@ -1,0 +1,1042 @@
+# %% [markdown]
+# # 11 — Networks of perceptrons
+#
+# | | |
+# | --- | --- |
+# | **Prerequisites** | Notebooks 00–10, especially 07 (the perceptron), 08 (linear separability and XOR), and 09 (sigmoid and binary cross-entropy) |
+# | **You will learn** | How to wire step units into networks by hand; why a hidden layer makes XOR linearly separable; a recipe that builds a network for *any* Boolean function, and what it costs; which regions of the plane one and two hidden layers can carve out; why networks of step units cannot be trained by gradient descent; how replacing the step with a sigmoid fixes that |
+# | **Estimated time** | About 3 hours, plus 1–2 hours for the exercises |
+# | **Compute** | CPU, under a minute. No GPU section: these networks are tiny. |
+
+# %% [markdown]
+# ## Setup
+
+# %%
+# Setup: make the course helpers importable and record the environment.
+import sys
+from pathlib import Path
+
+try:
+    import dlcourse
+except ImportError:  # running without `uv sync`, e.g. on Colab after cloning the repo
+    root = next(p for p in [Path.cwd(), *Path.cwd().parents] if (p / "dlcourse").is_dir())
+    sys.path.insert(0, str(root))
+    import dlcourse
+
+import matplotlib.pyplot as plt
+import torch
+
+from dlcourse import check, check_close, check_shape, passed, set_seed
+from dlcourse.plotting import setup_style
+
+setup_style()
+device = dlcourse.describe_environment()
+set_seed(0)
+
+# %%
+import itertools
+import math
+
+from matplotlib.path import Path as PolygonPath
+from torch import nn
+
+from dlcourse.data import make_blobs, make_rings, make_xor
+from dlcourse.plotting import COLORS, plot_dataset, plot_decision_boundary
+
+# %% [markdown]
+# ## The motivating problem
+#
+# Notebook 08 proved that **no single linear unit computes XOR**: the four points $(0,0), (1,1)$ (output 0) and $(0,1), (1,0)$ (output 1) cannot be split by one line. It also showed a way out — add a hand-designed feature such as $x_1 x_2$, and XOR becomes separable.
+#
+# Here is a different way out. Logic says
+#
+# $$\operatorname{XOR}(x_1, x_2) = \operatorname{AND}\big(\operatorname{OR}(x_1, x_2),\ \operatorname{NAND}(x_1, x_2)\big),$$
+#
+# and notebook 08 built OR, NAND, and AND each as a single perceptron. So what happens if we **feed the outputs of perceptrons into other perceptrons**?
+#
+# This notebook answers three questions:
+#
+# 1. Which functions and which regions of the plane can a *network* of perceptrons represent?
+# 2. How many units does that take?
+# 3. Why did such networks need a new training method — and what is the first step toward it?
+
+# %% [markdown]
+# ## 1. Composing logic gates: XOR from OR, NAND, and AND
+#
+# Throughout this notebook a **step unit** (a perceptron's output, with labels in $\{0, 1\}$) computes
+#
+# $$\operatorname{step}(z) = \begin{cases} 1 & z > 0 \\ 0 & z \le 0 \end{cases}, \qquad z = \mathbf{w}\cdot\mathbf{x} + b.$$
+#
+# The convention at $z = 0$ matters only for points exactly on a unit's line. We always choose biases so that no input we care about lands there (half-integers for Boolean inputs), so the convention never decides an answer.
+#
+# In code, `step(z)` is `(z > 0).float()`: a comparison gives a boolean tensor, and `.float()` turns it into 0s and 1s.
+
+# %%
+def step(z):
+    """Step unit applied elementwise: 1.0 where z > 0, else 0.0 (so step(0) = 0)."""
+    return (z > 0).float()
+
+
+X4 = torch.tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])   # (4, 2): the truth-table inputs
+print(step(torch.tensor([-1.0, 0.0, 1e-6, 2.0])))
+
+# %% [markdown]
+# Notebook 08's gates, each one unit with weights $\mathbf{w} \in \mathbb{R}^2$ and bias $b$:
+#
+# | Gate | $\mathbf{w}$ | $b$ | fires when |
+# | --- | --- | --- | --- |
+# | OR | $(1, 1)$ | $-0.5$ | $x_1 + x_2 > 0.5$: at least one input is 1 |
+# | NAND | $(-1, -1)$ | $1.5$ | $x_1 + x_2 < 1.5$: not both inputs are 1 |
+# | AND | $(1, 1)$ | $-1.5$ | $x_1 + x_2 > 1.5$: both inputs are 1 |
+#
+# A quick check on the truth table, computing all four rows at once with `X4 @ w + b` (shape `(4,)`):
+
+# %%
+gates = {
+    "OR": (torch.tensor([1.0, 1.0]), -0.5),
+    "NAND": (torch.tensor([-1.0, -1.0]), 1.5),
+    "AND": (torch.tensor([1.0, 1.0]), -1.5),
+}
+print("inputs:", X4.long().tolist())
+for name, (w, b) in gates.items():
+    print(f"{name:5s}", step(X4 @ w + b).long().tolist())
+
+# %% [markdown]
+# Now the composition. Write $h_1 = \operatorname{OR}(x_1, x_2)$ and $h_2 = \operatorname{NAND}(x_1, x_2)$. Row by row:
+#
+# | $x_1$ | $x_2$ | $h_1$ (OR) | $h_2$ (NAND) | AND$(h_1, h_2)$ | XOR |
+# | --- | --- | --- | --- | --- | --- |
+# | 0 | 0 | 0 | 1 | 0 | 0 |
+# | 0 | 1 | 1 | 1 | 1 | 1 |
+# | 1 | 0 | 1 | 1 | 1 | 1 |
+# | 1 | 1 | 1 | 0 | 0 | 0 |
+#
+# The last two columns agree, so the identity holds. As a network, the two hidden units form a **layer**: in `nn.Linear`'s layout `(out, in)`, row $j$ of $W^{(1)}$ holds the weights of hidden unit $j$:
+#
+# $$W^{(1)} = \begin{pmatrix} 1 & 1 \\ -1 & -1 \end{pmatrix} \begin{matrix} \leftarrow \text{OR} \\ \leftarrow \text{NAND} \end{matrix}, \quad \mathbf{b}^{(1)} = \begin{pmatrix} -0.5 \\ 1.5 \end{pmatrix}, \qquad W^{(2)} = \begin{pmatrix} 1 & 1 \end{pmatrix},\quad b^{(2)} = -1.5.$$
+#
+# For a batch $X$ of shape $(N, 2)$, one example per row:
+#
+# $$H = \operatorname{step}\big(X W^{(1)\top} + \mathbf{b}^{(1)}\big) \ \ (N, 2), \qquad \hat{\mathbf{y}} = \operatorname{step}\big(H W^{(2)\top} + b^{(2)}\big) \ \ (N, 1).$$
+#
+# $H$ is the **hidden representation**: what the output unit sees instead of $X$.
+
+# %%
+W1_xor = torch.tensor([[1.0, 1.0],      # hidden unit 1: OR
+                       [-1.0, -1.0]])   # hidden unit 2: NAND        (2 hidden, 2 inputs)
+b1_xor = torch.tensor([-0.5, 1.5])      # (2,)
+W2_xor = torch.tensor([[1.0, 1.0]])     # output unit: AND of the two hidden units   (1, 2)
+b2_xor = torch.tensor([-1.5])           # (1,)
+xor_layers = [(W1_xor, b1_xor), (W2_xor, b2_xor)]
+
+
+def run_step_network(X, layers):
+    """Apply h <- step(h @ W.T + b) for each (W, b) in layers. X: (N, D). Returns labels (N,) for one output unit."""
+    h = X
+    for W, b in layers:
+        h = step(h @ W.T + b)
+    return h.squeeze(1).long()
+
+
+H4 = step(X4 @ W1_xor.T + b1_xor)        # (4, 2) hidden representation
+y4_xor = torch.tensor([0, 1, 1, 0])
+print("hidden H (rows = inputs 00, 01, 10, 11):", H4.long().tolist())
+print("network output:", run_step_network(X4, xor_layers).tolist(), "  XOR:", y4_xor.tolist())
+check(torch.equal(run_step_network(X4, xor_layers), y4_xor), "the network should compute XOR")
+passed("Two-layer step network computes XOR")
+
+# %% [markdown]
+# ### Seeing it: input space and hidden space
+#
+# The network is defined for *any* real input, not just the four corners. Each hidden unit is a line in the input plane: the OR unit fires above $x_1 + x_2 = 0.5$, the NAND unit below $x_1 + x_2 = 1.5$. The output fires where both do — in the band between the lines.
+#
+# The helper below draws a unit's line $\mathbf{w}\cdot\mathbf{x} + b = 0$, with a short arrow along $\mathbf{w}$ pointing to the side where the unit fires (notebook 07: $\mathbf{w}$ is normal to the line and points toward $z > 0$).
+
+# %%
+def draw_unit_line(ax, w, b, color, label=None, center=(0.0, 0.0), span=6.0):
+    """Draw the line w·x + b = 0 and an arrow along w (the side where the unit fires)."""
+    w = torch.as_tensor(w, dtype=torch.float32)
+    b = float(b)
+    c = torch.tensor(center, dtype=torch.float32)
+    foot = c - (w @ c + b) * w / (w @ w)                  # point on the line closest to `center`
+    direction = torch.stack([-w[1], w[0]]) / w.norm()      # unit vector along the line
+    ends = torch.stack([foot - span * direction, foot + span * direction])
+    ax.plot(ends[:, 0], ends[:, 1], color=color, lw=2, label=label)
+    tip = foot + 0.3 * w / w.norm()
+    ax.annotate("", xy=tip.tolist(), xytext=foot.tolist(), arrowprops=dict(arrowstyle="->", color=color, lw=2))
+
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.6))
+plot_decision_boundary(lambda P: run_step_network(P, xor_layers), X4, y4_xor, ax=ax1, padding=0.5,
+                       title="Input space: output fires in the band")
+lims = ax1.get_xlim(), ax1.get_ylim()
+draw_unit_line(ax1, W1_xor[0], b1_xor[0], COLORS[2], "$h_1$ = OR: $x_1 + x_2 > 0.5$", center=(0.5, 0.5))
+draw_unit_line(ax1, W1_xor[1], b1_xor[1], COLORS[3], "$h_2$ = NAND: $x_1 + x_2 < 1.5$", center=(0.5, 0.5))
+ax1.set_xlim(*lims[0])
+ax1.set_ylim(*lims[1])
+ax1.legend(loc="upper right", fontsize=7)
+
+plot_decision_boundary(lambda Hh: step(Hh @ W2_xor.T + b2_xor).squeeze(1).long(), H4, y4_xor, ax=ax2,
+                       padding=0.5, title="Hidden space: XOR is now linearly separable")
+for (h1, h2), text in [((0, 1), "from (0,0)"), ((1, 1), "from (0,1) and (1,0)"), ((1, 0), "from (1,1)")]:
+    ax2.annotate(text, (h1, h2), xytext=(h1 - 0.45, h2 + 0.12), fontsize=8)
+ax2.set_xlabel("$h_1$ (OR unit)")
+ax2.set_ylabel("$h_2$ (NAND unit)")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# Left: in the input space, the two class-1 points sit between the hidden units' lines, and the shaded output region is exactly that band — a region no single line can produce. Right: the hidden layer maps the four inputs to only **three** points, because $(0,1)$ and $(1,0)$ land on the same spot $(1,1)$. In hidden space a single line, $h_1 + h_2 = 1.5$ (the AND unit), separates the classes.
+#
+# This is the central idea of the notebook, and of deep learning: **a hidden layer transforms the data so that a linear unit can separate it.** Notebook 08 did the same with a hand-designed feature map $\boldsymbol\phi(\mathbf{x}) = (x_1, x_2, x_1 x_2)$. Here the features $h_1, h_2$ are themselves computed by units with weights — so, in principle, they could be *learned* rather than designed. Section 5 shows why that is harder than it sounds for step units.
+
+# %% [markdown]
+# ### Checkpoint 1.1
+#
+# AND(OR, NAND) is not the only way to wire XOR. Logic also gives
+#
+# $$\operatorname{XOR}(x_1, x_2) = \operatorname{OR}\big(\operatorname{AND}(x_1, \operatorname{NOT} x_2),\ \operatorname{AND}(\operatorname{NOT} x_1, x_2)\big):$$
+#
+# "exactly the first is on, or exactly the second is on". Build this network as `xor2_layers = [(W1, b1), (W2, b2)]` with shapes `(2, 2)`, `(2,)`, `(1, 2)`, `(1,)`. Hidden unit 1 should fire only on input $(1, 0)$, hidden unit 2 only on $(0, 1)$. Choose half-integer biases.
+
+# %% [markdown] tags=["hint"]
+# "$x_1$ and not $x_2$" fires when $x_1 - x_2 > 0.5$: weights $(1, -1)$, bias $-0.5$. Check all four inputs by hand: $x_1 - x_2 - 0.5$ is $-0.5, -1.5, 0.5, -0.5$. The output OR is weights $(1, 1)$, bias $-0.5$.
+
+# %%
+# BEGIN SOLUTION
+xor2_layers = [
+    (torch.tensor([[1.0, -1.0], [-1.0, 1.0]]), torch.tensor([-0.5, -0.5])),
+    (torch.tensor([[1.0, 1.0]]), torch.tensor([-0.5])),
+]
+# END SOLUTION
+
+# %% tags=["check"]
+(_W1, _b1), (_W2, _b2) = xor2_layers
+check_shape(_W1, (2, 2), "W1")
+check_shape(_b1, (2,), "b1")
+check_shape(_W2, (1, 2), "W2")
+check_shape(_b2, (1,), "b2")
+check(torch.equal(step(X4 @ _W1.T + _b1), torch.tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 0.0]])),
+      "hidden unit 1 should fire only on (1, 0) and hidden unit 2 only on (0, 1)")
+check(torch.equal(run_step_network(X4, xor2_layers), y4_xor), "the network should compute XOR")
+passed("Checkpoint 1.1")
+
+# %% [markdown]
+# This second network maps $(0,0)$ and $(1,1)$ to the same hidden point $(0, 0)$, and the output only has to ask "is any hidden unit on?". It is a special case of the general recipe in the next section.
+
+# %% [markdown]
+# ## 2. Any Boolean function: disjunctive normal form
+#
+# A **Boolean function** of $n$ inputs assigns 0 or 1 to each of the $2^n$ input patterns; its truth table is a list of $2^n$ bits. There are $2^{2^n}$ of them: 16 for $n = 2$, 256 for $n = 3$. Can a two-layer step network compute *every* one?
+#
+# Yes, by the recipe Checkpoint 1.1 used, called **disjunctive normal form** (DNF): "the output is 1 if the input is pattern $\mathbf{p}_1$, **or** pattern $\mathbf{p}_2$, **or** …", listing every pattern whose output is 1.
+#
+# **A detector for one pattern.** For a pattern $\mathbf{p} \in \{0,1\}^n$ with $k$ ones, take
+#
+# $$w_j = \begin{cases} +1 & p_j = 1 \\ -1 & p_j = 0 \end{cases} \quad (\text{i.e. } \mathbf{w} = 2\mathbf{p} - \mathbf{1}), \qquad b = -k + \tfrac12.$$
+#
+# For a binary input $\mathbf{x}$, let $d(\mathbf{x}, \mathbf{p})$ be the number of positions where they differ (the Hamming distance). Each 1 of $\mathbf{p}$ that $\mathbf{x}$ misses removes $+1$ from $\mathbf{w}\cdot\mathbf{x}$ relative to $k$; each extra 1 in $\mathbf{x}$ where $\mathbf{p}$ has 0 adds $-1$. So $\mathbf{w}\cdot\mathbf{x} = k - d(\mathbf{x}, \mathbf{p})$ and
+#
+# $$\mathbf{w}\cdot\mathbf{x} + b = \tfrac12 - d(\mathbf{x}, \mathbf{p}),$$
+#
+# which is positive **only** when $d = 0$, i.e. $\mathbf{x} = \mathbf{p}$. The unit is an AND of the required bits and of the negations of the others.
+#
+# **The output** is an OR of the detectors: weights all 1, bias $-\tfrac12$, so it fires if at least one detector does. Exactly one detector fires on a true pattern, none on a false one. The network has one hidden unit per row of the truth table with output 1.
+
+# %%
+def all_inputs(n):
+    """All 2**n binary input patterns as a (2**n, n) float tensor, in counting order (00..0, 00..1, ...)."""
+    return torch.tensor(list(itertools.product([0.0, 1.0], repeat=n)))
+
+
+def dnf_layers(truth_table):
+    """Two-layer step network for any Boolean function.
+
+    truth_table: (2**n,) tensor of 0/1, one entry per row of all_inputs(n).
+    Returns [(W1, b1), (W2, b2)] with W1: (H, n), b1: (H,), W2: (1, H), b2: (1,), H = number of 1s.
+    """
+    n = int(math.log2(len(truth_table)))
+    P = all_inputs(n)[truth_table.bool()]          # (H, n): the patterns that must output 1
+    W1 = 2 * P - 1                                 # +1 where the pattern has a 1, -1 where it has a 0
+    b1 = -P.sum(dim=1) + 0.5                       # -k + 1/2
+    W2 = torch.ones(1, P.shape[0])                 # OR of all detectors
+    b2 = torch.tensor([-0.5])
+    return [(W1, b1), (W2, b2)]
+
+
+xor_dnf = dnf_layers(torch.tensor([0, 1, 1, 0]))
+print("W1 =", xor_dnf[0][0].tolist(), "  b1 =", xor_dnf[0][1].tolist())
+
+# %% [markdown]
+# For XOR the recipe produces exactly the network of Checkpoint 1.1. Now all 16 two-input functions. Function number $f$ has truth table given by the 4 bits of $f$, most significant bit for input $(0,0)$. A few have names:
+
+# %%
+names = {"0000": "FALSE", "0001": "AND", "0110": "XOR", "0111": "OR",
+         "1000": "NOR", "1001": "XNOR", "1110": "NAND", "1111": "TRUE"}
+n_correct = 0
+for f in range(16):
+    bits = format(f, "04b")
+    table = torch.tensor([int(c) for c in bits])            # (4,)
+    layers = dnf_layers(table)
+    ok = torch.equal(run_step_network(X4, layers), table)
+    n_correct += ok
+    print(f"truth table {bits} {names.get(bits, ''):5s}: {layers[0][0].shape[0]} hidden units, correct = {ok}")
+check(n_correct == 16, "every two-input function should be computed correctly")
+passed("DNF networks compute all 16 two-input Boolean functions")
+
+# %% [markdown]
+# Including the two extreme cases: FALSE gets **zero** hidden units (the output is $\operatorname{step}(-0.5) = 0$ for every input, and a `(N, 0) @ (0, 1)` product is a column of zeros), and TRUE gets four. The same function works for any $n$; here are a random 3-input function and a random 8-input one (256 rows):
+
+# %%
+gen = torch.Generator().manual_seed(11)
+for n in [3, 8]:
+    table = torch.randint(0, 2, (2**n,), generator=gen)       # a random truth table
+    layers = dnf_layers(table)
+    ok = torch.equal(run_step_network(all_inputs(n), layers), table)
+    print(f"n = {n}: {2**n} rows, {int(table.sum())} ones -> {layers[0][0].shape[0]} hidden units, correct on all rows = {ok}")
+    check(ok, f"DNF network for n = {n}")
+passed("DNF networks compute random 3- and 8-input functions")
+
+# %% [markdown]
+# So two layers of step units can compute **every** Boolean function. That is a representation result: it says such a network *exists*. It says nothing yet about finding it from data.
+#
+# ### What it costs
+#
+# The recipe uses one hidden unit per true row — up to $2^n$ units. That is exponential in the number of inputs: for $n = 30$ it could be a billion units. Sometimes a smarter construction is far smaller. **Parity** ("is the number of 1s odd?", XOR generalized to $n$ inputs) has $2^{n-1}$ true rows, so DNF uses $2^{n-1}$ units. But consider $n$ "counting" units $h_k = \operatorname{step}\big(\sum_j x_j - k + \tfrac12\big)$ for $k = 1, \dots, n$: $h_k$ fires when at least $k$ inputs are on. If $c$ inputs are on, the hidden vector is $c$ ones followed by zeros, so the alternating sum $h_1 - h_2 + h_3 - \cdots$ equals $c \bmod 2$. An output unit with weights $(+1, -1, +1, \dots)$ and bias $-\tfrac12$ therefore computes parity with only $n$ hidden units:
+
+# %%
+def parity_layers(n):
+    """Parity of n bits with n 'at least k inputs on' hidden units."""
+    W1 = torch.ones(n, n)                                       # every unit sums all inputs
+    b1 = -torch.arange(1, n + 1, dtype=torch.float32) + 0.5    # unit k: sum > k - 1/2
+    W2 = torch.tensor([[(-1.0) ** k for k in range(n)]])        # +1, -1, +1, ...
+    return [(W1, b1), (W2, torch.tensor([-0.5]))]
+
+
+print(" n   DNF units   counting units   both correct")
+for n in [2, 4, 6, 8, 10]:
+    X_all = all_inputs(n)
+    parity = (X_all.sum(dim=1) % 2).long()                     # (2**n,)
+    dnf = dnf_layers(parity)
+    ok = torch.equal(run_step_network(X_all, dnf), parity) and torch.equal(run_step_network(X_all, parity_layers(n)), parity)
+    check(ok, f"parity networks for n = {n}")
+    print(f"{n:2d}   {dnf[0][0].shape[0]:9d}   {n:14d}   {ok}")
+
+# %% [markdown]
+# For 10 inputs: 512 hidden units versus 10. So the *size* a function needs depends on the construction, and DNF is a universal recipe, not an efficient one. For most functions no clever trick exists: a counting argument, which we state without proof, shows that most Boolean functions of $n$ inputs need a number of threshold units that grows exponentially with $n$, whatever the architecture. Which functions are cheap, and whether **depth** (more layers) makes them cheaper, is the theme of notebook 12. (The chapter problem set uses the alternating-sum trick to build a checkerboard.)
+
+# %% [markdown]
+# ### Checkpoint 2.1
+#
+# 1. Write the weights `w_101` (shape `(3,)`) and bias `b_101` (a float) of the DNF detector for the 3-input pattern $\mathbf{p} = (1, 0, 1)$, using the formulas above (not `dnf_layers`).
+# 2. The 3-input **majority** function outputs 1 when at least two inputs are 1. How many hidden units does the DNF construction use for it? Store the number in `n_units_majority`. Count by hand.
+
+# %% [markdown] tags=["hint"]
+# $\mathbf{w} = 2\mathbf{p} - \mathbf{1}$ and $b = -k + \tfrac12$ with $k$ the number of ones in $\mathbf{p}$. For majority, list the 3-bit patterns with at least two 1s.
+
+# %%
+# BEGIN SOLUTION
+w_101 = torch.tensor([1.0, -1.0, 1.0])
+b_101 = -1.5
+n_units_majority = 4   # 011, 101, 110, 111
+# END SOLUTION
+
+# %% tags=["check"]
+check_shape(w_101, (3,), "w_101")
+_fires = step(all_inputs(3) @ w_101 + b_101)
+check(torch.equal(_fires, (all_inputs(3) == torch.tensor([1.0, 0.0, 1.0])).all(dim=1).float()),
+      "the detector should fire on (1, 0, 1) and on no other input")
+check_close(b_101, -1.5, "b_101")
+check(n_units_majority == int((all_inputs(3).sum(dim=1) >= 2).sum()), "count the patterns with at least two ones")
+passed("Checkpoint 2.1")
+
+# %% [markdown]
+# ## 3. Regions in the plane
+#
+# Boolean inputs are only the corners of a square. On real-valued inputs $\mathbf{x} \in \mathbb{R}^2$, a step unit fires on a **half-plane** $\{\mathbf{x} : \mathbf{w}\cdot\mathbf{x} + b > 0\}$, the side of its line that $\mathbf{w}$ points to. The units of a hidden layer turn every point into a bit vector — which side of each line it is on — and the later layers compute a Boolean function of those bits. So: which regions can we carve out?
+#
+# ### AND of half-planes: convex polygons
+#
+# An output unit with weights all 1 and bias $-k + \tfrac12$ over $k$ hidden units fires only when all $k$ fire (the sum of $k$ bits exceeds $k - \tfrac12$ only if it is $k$). So it detects the **intersection** of $k$ half-planes.
+#
+# A set is **convex** if, with any two of its points, it contains the whole segment between them. A half-plane is convex: if $\mathbf{w}\cdot\mathbf{x} + b > 0$ and $\mathbf{w}\cdot\mathbf{x}' + b > 0$, then for $0 \le t \le 1$, $\mathbf{w}\cdot(t\mathbf{x} + (1-t)\mathbf{x}') + b = t(\mathbf{w}\cdot\mathbf{x} + b) + (1-t)(\mathbf{w}\cdot\mathbf{x}' + b) > 0$. If a segment lies in each of several sets it lies in their intersection, so **an intersection of half-planes is convex**: a convex polygon (possibly unbounded). One hidden layer plus an AND output can therefore detect any convex polygon, with one hidden unit per edge.
+#
+# A triangle with vertices $(0, 0)$, $(1, 0)$, $(0, 1)$ is the intersection of $x_1 > 0$, $x_2 > 0$, and $x_1 + x_2 < 1$:
+
+# %%
+W_tri = torch.tensor([[1.0, 0.0],      # x1 > 0
+                      [0.0, 1.0],      # x2 > 0
+                      [-1.0, -1.0]])   # 1 - x1 - x2 > 0             (3, 2)
+b_tri = torch.tensor([0.0, 0.0, 1.0])  # (3,)
+tri_layers = [(W_tri, b_tri), (torch.ones(1, 3), torch.tensor([-2.5]))]   # AND of 3 units
+
+gen = torch.Generator().manual_seed(1)
+P = 3 * torch.rand(2000, 2, generator=gen) - 1             # (2000, 2) test points on [-1, 2]^2
+inside_ref = ((P[:, 0] > 0) & (P[:, 1] > 0) & (P.sum(dim=1) < 1)).long()   # direct definition
+print("triangle detector agrees with the direct test on", int((run_step_network(P, tri_layers) == inside_ref).sum()), "of", len(P), "points")
+
+inside_pts = P[run_step_network(P, tri_layers) == 1]          # points the detector accepts
+t = torch.rand(len(inside_pts), 1, generator=gen)
+mixes = t * inside_pts + (1 - t) * inside_pts.roll(1, dims=0)  # random points on segments between accepted points
+print("random points on segments between accepted points that are accepted too:",
+      f"{run_step_network(mixes, tri_layers).float().mean().item():.0%}")
+
+# %% [markdown]
+# The detector agrees with the triangle's definition everywhere, and every point on a segment between two accepted points is accepted — convexity, checked numerically.
+#
+# ### OR of half-planes: unions
+#
+# An output with weights all 1 and bias $-\tfrac12$ fires if **any** hidden unit fires: the **union** of the half-planes. A union need not be convex. With the two units $x_1 > 0.5$ and $x_2 > 0.5$, the OR output fires everywhere except the bottom-left quadrant below $(0.5, 0.5)$, an L-shaped, non-convex region.
+
+# %%
+W_or = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+b_or = torch.tensor([-0.5, -0.5])
+or_layers = [(W_or, b_or), (torch.ones(1, 2), torch.tensor([-0.5]))]
+y_or_ref = ((P[:, 0] > 0.5) | (P[:, 1] > 0.5)).long()
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+for ax, layers, y_ref, title in [(axes[0], tri_layers, inside_ref, "AND of 3 half-planes: a triangle (convex)"),
+                                 (axes[1], or_layers, y_or_ref, "OR of 2 half-planes: a union (not convex)")]:
+    plot_decision_boundary(lambda Q, L=layers: run_step_network(Q, L), P[:300], y_ref[:300], ax=ax, padding=0.0, title=title)
+    W, b = layers[0]
+    for j in range(W.shape[0]):
+        draw_unit_line(ax, W[j], b[j], COLORS[2 + j], f"unit {j + 1}", center=(0.5, 0.5))
+    ax.set_xlim(-1, 2)
+    ax.set_ylim(-1, 2)
+    ax.legend(loc="lower left", fontsize=7)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# The dots are test points colored by the *direct* definition of each region; they agree with the shading, which comes from the network. The arrows show each unit's firing side: in the triangle, all three arrows point inward; in the union, the output fires wherever at least one arrow's side is reached.
+
+# %% [markdown]
+# ### Checkpoint 3.1
+#
+# Stretch the triangle: vertices $(0, 0)$, $(2, 0)$, $(0, 1)$. Its three edges give units with weights `W_tri2` below (the third edge is the line through $(2, 0)$ and $(0, 1)$, i.e. $x_1 + 2x_2 = 2$). Find the bias vector `b_tri2` (shape `(3,)`) so that each unit fires on the triangle's side of its edge.
+
+# %% [markdown] tags=["hint"]
+# The first two edges are unchanged. The third unit computes $-x_1 - 2x_2 + b_3$; it must be 0 on the edge (try the vertex $(2, 0)$) and positive at the origin.
+
+# %%
+W_tri2 = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -2.0]])   # (3, 2)
+# BEGIN SOLUTION
+b_tri2 = torch.tensor([0.0, 0.0, 2.0])
+# END SOLUTION
+
+# %% tags=["check"]
+check_shape(b_tri2, (3,), "b_tri2")
+_layers = [(W_tri2, b_tri2.float()), (torch.ones(1, 3), torch.tensor([-2.5]))]
+_ref = ((P[:, 0] > 0) & (P[:, 1] > 0) & (P[:, 0] + 2 * P[:, 1] < 2)).long()
+check((run_step_network(P, _layers) == _ref).float().mean().item() > 0.999, "the detector should accept exactly the stretched triangle")
+passed("Checkpoint 3.1")
+
+# %% [markdown]
+# ### Two hidden layers: any polygonal region
+#
+# Now combine both ideas. Take a square **with a square hole**: the frame between $[-1, 1]^2$ and $[-0.5, 0.5]^2$. It is not convex (the segment between opposite sides of the frame crosses the hole). But it is a union of four convex rectangles — top, bottom, left, and right strips — so:
+#
+# - **layer 1:** one unit per line: $x_1 > -1$, $x_1 < 1$, $x_2 > -1$, $x_2 < 1$ (the outer square), $x_1 < -0.5$, $x_1 > 0.5$, $x_2 < -0.5$, $x_2 > 0.5$ (outside each side of the hole) — 8 units;
+# - **layer 2:** one AND unit per strip (each a convex rectangle, four of the layer-1 units) — 4 units;
+# - **output:** OR of the strips.
+#
+# For example, the top strip $-1 < x_1 < 1$, $0.5 < x_2 < 1$ is the AND of layer-1 units 1, 2, 4, and 8.
+
+# %%
+W1_frame = torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],     # inside the outer square
+                         [-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]])    # beyond each side of the hole   (8, 2)
+b1_frame = torch.tensor([1.0, 1.0, 1.0, 1.0, -0.5, -0.5, -0.5, -0.5])         # (8,)
+strips = {"top": [0, 1, 3, 7], "bottom": [0, 1, 2, 6], "left": [0, 2, 3, 4], "right": [1, 2, 3, 5]}
+W2_frame = torch.zeros(4, 8)                                                   # (4 strips, 8 lines)
+for row, units in enumerate(strips.values()):
+    W2_frame[row, units] = 1.0
+b2_frame = torch.full((4,), -3.5)                                              # AND of 4 units
+frame_layers = [(W1_frame, b1_frame), (W2_frame, b2_frame), (torch.ones(1, 4), torch.tensor([-0.5]))]
+
+gen = torch.Generator().manual_seed(2)
+Q = 3 * torch.rand(4000, 2, generator=gen) - 1.5                               # (4000, 2) on [-1.5, 1.5]^2
+y_frame = ((Q.abs().max(dim=1).values < 1) & (Q.abs().max(dim=1).values > 0.5)).long()   # direct definition
+agree = (run_step_network(Q, frame_layers) == y_frame).float().mean().item()
+print(f"two-hidden-layer frame detector agrees with the direct test on {agree:.2%} of points")
+check(agree == 1.0, "frame detector")
+
+# %% [markdown]
+# **Why this is a general recipe.** The lines of layer 1 cut the plane into cells, and every point in the same cell gets the same bit vector from layer 1. Any region whose boundary lies on those lines is a union of cells, so it is a Boolean function of the layer-1 bits — and Section 2 says layers 2 and 3 can compute any Boolean function. Every polygon, convex or not, with or without holes, can be cut into finitely many triangles (a standard fact of geometry, stated without proof), so **two hidden layers of step units can carve out any polygonal region**, exactly.
+#
+# **And with one hidden layer?** Then the output is a threshold of a weighted *vote* of half-planes, $\operatorname{step}(\sum_j v_j h_j + c)$. That can still do a lot. For the frame, give the four outer-square units weight 2, the four hole units weight 1, and use bias $-8.5$. Inside the outer square the outer units contribute $8$; outside it at most $6$. Of the hole units, at least one fires everywhere outside the hole and at most two fire anywhere (a point cannot be both left and right of the hole). So the vote exceeds $8.5$ exactly when the point is inside the outer square **and** outside the hole:
+
+# %%
+frame_one_layer = [(W1_frame, b1_frame), (torch.tensor([[2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0]]), torch.tensor([-8.5]))]
+agree1 = (run_step_network(Q, frame_one_layer) == y_frame).float().mean().item()
+print(f"one-hidden-layer frame detector agrees with the direct test on {agree1:.2%} of points")
+check(agree1 == 1.0, "one-layer frame detector")
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+plot_decision_boundary(lambda Z: run_step_network(Z, frame_layers), Q[:600], y_frame[:600], ax=axes[0], padding=0.0,
+                       title="Two hidden layers (8 → 4 → 1): OR of 4 strips")
+plot_decision_boundary(lambda Z: run_step_network(Z, frame_one_layer), Q[:600], y_frame[:600], ax=axes[1], padding=0.0,
+                       title="One hidden layer (8 → 1): weighted vote")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# Both networks carve out the same non-convex frame with a hole; the dots (colored by the direct definition) agree with the shading everywhere. So one hidden layer **can** represent non-convex regions — but notice how the two constructions differ. The two-hidden-layer recipe was mechanical (strips, then AND, then OR) and works for any polygon. The one-layer vote needed a trick that exploited this particular shape.
+#
+# The trick does not always exist for a given set of lines. The four-quadrant checkerboard (class 1 where $x_1 x_2 > 0$) has the two axes as its boundary; with only the units $x_1 > 0$ and $x_2 > 0$ in the hidden layer, the output must compute XNOR of the two hidden bits, which notebook 08 proved no single unit can do. More generally, it is known that some polygonal regions cannot be represented exactly by *any* one-hidden-layer network of step units, however many units it has, while two hidden layers always suffice (Gibson and Cowan, 1990; stated without proof). Exactness is a strong demand, though: notebook 12 shows that for *approximating* functions, one hidden layer is already enough.
+
+# %% [markdown]
+# ## 4. A disk from a polygon
+#
+# A linear classifier (notebooks 07–10) separates two classes with a single line, which is useless for `make_rings`: class 0 on a ring of radius 0.5, class 1 on a ring of radius 1, with noise. The natural boundary is a circle of radius about 0.75 between the rings — curved, not polygonal. A step network can only draw straight edges, but it can draw many of them.
+#
+# A **regular $k$-gon** around the origin with **apothem** $r$ (distance from the center to each edge) is the intersection of $k$ half-planes. Edge $j$ has outward unit normal $\mathbf{n}_j = (\cos\theta_j, \sin\theta_j)$ with $\theta_j = 2\pi j / k$, and the inside of that edge is $\mathbf{n}_j\cdot\mathbf{x} < r$, i.e. the unit $\mathbf{w}_j = -\mathbf{n}_j$, $b_j = r$. The output ANDs all $k$ units. Since the inside of the polygon is class 0, the predicted label is $1 - \text{output}$.
+
+# %%
+def regular_polygon_layers(k, r=0.75):
+    """Step network that outputs 1 inside the regular k-gon with apothem r (k hidden units)."""
+    theta = 2 * math.pi * torch.arange(k) / k                        # (k,) normal directions
+    normals = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)  # (k, 2) outward unit normals
+    return [(-normals, torch.full((k,), r)), (torch.ones(1, k), torch.tensor([-(k - 0.5)]))]
+
+
+def polygon_classifier(X, k, r=0.75):
+    """Label 0 inside the k-gon (inner ring), 1 outside. X: (N, 2) -> (N,)."""
+    return 1 - run_step_network(X, regular_polygon_layers(k, r))
+
+
+X_rings, y_rings = make_rings(n=400, seed=0)                          # (800, 2), (800,)
+ks = list(range(3, 17))
+accs = [(polygon_classifier(X_rings, k) == y_rings).float().mean().item() for k in ks]
+acc_circle = ((X_rings.norm(dim=1) > 0.75).long() == y_rings).float().mean().item()
+for k, a in zip(ks, accs):
+    if k in (3, 4, 5, 6, 8, 12, 16):
+        print(f"k = {k:2d} hidden units: accuracy {a:.2%}")
+print(f"exact circle of radius 0.75: accuracy {acc_circle:.2%}")
+
+# %%
+fig, axes = plt.subplots(1, 4, figsize=(15, 4))
+for ax, k in zip(axes, [3, 4, 6, 12]):
+    a = (polygon_classifier(X_rings, k) == y_rings).float().mean().item()
+    plot_decision_boundary(lambda Z, k=k: polygon_classifier(Z, k), X_rings, y_rings, ax=ax,
+                           title=f"k = {k} units: accuracy {a:.1%}")
+    if ax.get_legend():
+        ax.get_legend().remove()
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# The boundary is always a polygon: straight edges and sharp corners, never a curve. With $k = 3$ the triangle's corners stick far out into the outer ring; with more units the polygon hugs the circle of radius 0.75 more closely.
+
+# %%
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(ks, accs, "o-", label="regular k-gon, apothem 0.75")
+ax.axhline(acc_circle, color="gray", ls="--", label="exact circle, radius 0.75")
+ax.set_xlabel("number of hidden units k (edges of the polygon)")
+ax.set_ylabel("training accuracy")
+ax.set_title("make_rings: polygon detector accuracy vs. hidden units")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+# Accuracy rises quickly with $k$ and then levels off at the circle's accuracy. It cannot go beyond that with this family, because the rings' noise makes a few points cross radius 0.75: no circle, and no polygon close to one, classifies those. Notice also that the curve need not be perfectly monotone: going from $k$ to $k+1$ rotates the corners as well as adding one, so a few points can flip either way.
+#
+# **Why more units help, quantitatively.** A regular $k$-gon with apothem $r$ lies between the circle of radius $r$ (touching the middle of each edge) and the circle through its corners, of radius $R = r / \cos(\pi/k)$ (the corner is at angle $\pi/k$ from the nearest edge's normal). As $k \to \infty$, $\cos(\pi/k) \to 1$ and the polygon squeezes onto the circle.
+
+# %% [markdown]
+# ### Checkpoint 4.1
+#
+# Compute the corner radius $R = r/\cos(\pi/k)$ for every $k$ in `ks` with $r = 0.75$, as a tensor `corner_radius` of shape `(len(ks),)`. Then think: for which $k$ do the corners reach the outer ring (radius 1)?
+
+# %% [markdown] tags=["hint"]
+# `torch.tensor(ks, dtype=torch.float32)` gives the $k$ values; `torch.cos(math.pi / k_tensor)` works elementwise.
+
+# %%
+# BEGIN SOLUTION
+corner_radius = 0.75 / torch.cos(math.pi / torch.tensor(ks, dtype=torch.float32))
+# END SOLUTION
+
+# %% tags=["check"]
+check_shape(corner_radius, (len(ks),), "corner_radius")
+for _i, _k in enumerate(ks):
+    _corner_angle = math.pi / _k                                   # the corner between the normals at 0 and 2π/k
+    _dir = torch.tensor([[math.cos(_corner_angle), math.sin(_corner_angle)]])
+    _R = corner_radius[_i].item()
+    check(run_step_network(0.999 * _R * _dir, regular_polygon_layers(_k)).item() == 1
+          and run_step_network(1.001 * _R * _dir, regular_polygon_layers(_k)).item() == 0,
+          f"for k = {_k}, the corner should be at radius {_R:.4f}")
+passed("Checkpoint 4.1")
+print("k with corners beyond radius 1:", [k for k, R in zip(ks, corner_radius.tolist()) if R > 1])
+
+# %% [markdown]
+# The check placed points just inside and just outside your radius along a corner direction, and the network agreed. Only $k = 3$ and $k = 4$ have corners beyond radius 1, which is why those two do much worse. For $k = 12$, $R \approx 0.776$: the polygon is within $0.026$ of the circle everywhere.
+
+# %% [markdown]
+# ## 5. Why we cannot train step networks
+#
+# Everything so far was designed by hand. For real problems — images, text — nobody can write the weights down; they must be **learned** from data. Notebook 07 had a learning rule for one step unit, and notebooks 06 and 09 used gradient descent. Neither works for a network of step units. Let's see why, using a noisy version of the XOR truth table: four Gaussian clusters at the corners $(0,0)$, $(0,1)$, $(1,0)$, $(1,1)$, labelled by XOR of the corner.
+
+# %%
+X_xc, corner = make_blobs(n=50, centers=((0, 0), (0, 1), (1, 0), (1, 1)), std=0.15, seed=0)   # (200, 2), corner index 0..3
+y_xc = ((corner == 1) | (corner == 2)).long()                    # XOR of the corner's bits: (200,)
+acc_hand = (run_step_network(X_xc, xor_layers) == y_xc).float().mean().item()
+print(f"hand-built XOR network on the noisy corners: accuracy {acc_hand:.1%}")
+
+# %% [markdown]
+# The hand-built network classifies nearly all of these points (a few noisy points land on the wrong side of its lines). Could gradient descent have found it?
+#
+# ### Autograd gets no path through a step
+
+# %%
+W1_try = W1_xor.clone().requires_grad_(True)                     # (2, 2) hidden weights we would like to learn
+z = X_xc @ W1_try.T + b1_xor                                     # (200, 2): depends on W1_try
+h = step(z)                                                      # (z > 0).float()
+print("z.requires_grad:", z.requires_grad, "  h.requires_grad:", h.requires_grad, "  h.grad_fn:", h.grad_fn)
+
+try:
+    torch.heaviside(z, torch.tensor(0.0)).sum().backward()
+except RuntimeError as err:
+    print("torch.heaviside backward:", err)
+
+# %% [markdown]
+# A comparison like `z > 0` is not differentiable, so autograd records nothing: `h` is cut off from `W1_try`. PyTorch's `torch.heaviside` (the same step function) refuses to backpropagate at all.
+#
+# If the hidden units are steps but the output is a smooth unit — a logistic output trained with BCE as in notebook 09 — then gradients reach the output weights but not the hidden ones:
+
+# %%
+W2_try = torch.tensor([[1.0, 1.0]], requires_grad=True)
+b2_try = torch.tensor([-1.5], requires_grad=True)
+logits = step(X_xc @ W1_try.T + b1_xor) @ W2_try.T + b2_try      # (200, 1): step hidden layer, linear output
+loss = nn.functional.binary_cross_entropy_with_logits(logits.squeeze(1), y_xc.float())
+loss.backward()
+print("output weights' gradient:", W2_try.grad)
+print("hidden weights' gradient:", W1_try.grad)
+
+# %% [markdown]
+# The hidden weights get `None`: no gradient at all. Such a network can only train its last layer, on top of fixed hidden features — which is exactly what Rosenblatt's original perceptron machine did, with a fixed random first layer.
+#
+# ### It is not just autograd: the true derivative is zero
+#
+# Could we fix this by defining the derivative ourselves? The step function is flat on both sides of 0: its derivative is $0$ for every $z \ne 0$ and does not exist at $z = 0$. By the chain rule, any gradient that passes through a step is multiplied by $0$. Equivalently: nudging a hidden weight a little moves a line a little, and unless the line crosses a data point, **no prediction changes at all**.
+#
+# Let's measure that. The function `error_at(b)` sets the OR unit's bias $b^{(1)}_1$ to `b` and returns the fraction of misclassified points. We plot it against `b`, together with the same scan for a smooth version of the network in which every step is replaced by the sigmoid $\sigma(5z)$ (introduced properly in Section 6) and the loss is binary cross-entropy.
+
+# %%
+def error_at(b, X=X_xc, y=y_xc):
+    """Error rate of the hand-built XOR network when the OR unit's bias is set to b."""
+    b1 = b1_xor.clone()
+    b1[0] = b
+    return (run_step_network(X, [(W1_xor, b1), (W2_xor, b2_xor)]) != y).float().mean().item()
+
+
+def smooth_loss_at(b, X=X_xc, y=y_xc, k=5.0):
+    """BCE of the same network with every step(z) replaced by sigmoid(k z)."""
+    b1 = b1_xor.clone()
+    b1[0] = b
+    h = torch.sigmoid(k * (X @ W1_xor.T + b1))
+    p = torch.sigmoid(k * (h @ W2_xor.T + b2_xor)).squeeze(1)
+    return nn.functional.binary_cross_entropy(p, y.float()).item()
+
+
+bs_scan = torch.linspace(-2.5, 1.0, 1401)
+errs = [error_at(b) for b in bs_scan.tolist()]
+smooth = [smooth_loss_at(b) for b in bs_scan.tolist()]
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+ax1.plot(bs_scan, errs, color=COLORS[0])
+ax1.axvline(-0.5, color="gray", ls=":", label="hand-built value −0.5")
+ax1.set_xlabel("bias of the OR unit $b^{(1)}_1$")
+ax1.set_ylabel("error rate")
+ax1.set_title("Step network: error rate is piecewise constant")
+ax1.legend()
+ax2.plot(bs_scan, smooth, color=COLORS[1])
+ax2.axvline(-0.5, color="gray", ls=":", label="hand-built value −0.5")
+ax2.set_xlabel("bias of the OR unit $b^{(1)}_1$")
+ax2.set_ylabel("binary cross-entropy")
+ax2.set_title("Sigmoid network σ(5z): loss is smooth")
+ax2.legend()
+plt.tight_layout()
+plt.show()
+
+flat = sum(e1 == e0 for e0, e1 in zip(errs[:-1], errs[1:])) / (len(errs) - 1)
+print(f"fraction of neighbouring scan points with exactly equal error rate: {flat:.1%}")
+
+# %% [markdown]
+# Left: the error rate is a staircase. It only changes when the OR unit's line $x_1 + x_2 = -b$ sweeps across a data point; between those jumps it is exactly flat, so its slope is zero. Gradient descent standing on a flat step has no idea which way to go. Right: with smooth units the loss is a smooth curve with a nonzero slope almost everywhere, pointing toward its minimum — something gradient descent can follow. (The smooth loss is lowest slightly to the right of $-0.5$: with soft units, the best bias for the probabilities is not exactly the hand-picked one.)
+
+# %% [markdown]
+# ### Checkpoint 5.1
+#
+# Estimate the derivative of the error rate with respect to the OR unit's bias at the hand-built value $b = -0.5$ with a central finite difference (notebook 03), step $h = 10^{-3}$, using `error_at`. Store it in `fd_slope`.
+
+# %% [markdown] tags=["hint"]
+# `(error_at(b + h) - error_at(b - h)) / (2 * h)`.
+
+# %%
+b0, h_fd = -0.5, 1e-3
+# BEGIN SOLUTION
+fd_slope = (error_at(b0 + h_fd) - error_at(b0 - h_fd)) / (2 * h_fd)
+# END SOLUTION
+print("finite-difference slope of the error rate:", fd_slope)
+
+# %% tags=["check"]
+check_close(fd_slope, (error_at(-0.5 + 1e-3) - error_at(-0.5 - 1e-3)) / 2e-3, "fd_slope")
+check(fd_slope == 0.0, "the error rate should not change at all for such a small nudge")
+passed("Checkpoint 5.1")
+
+# %% [markdown]
+# Exactly zero: no point lies within $10^{-3}$ of the line, so no prediction changed. A gradient-based learner gets no signal here.
+#
+# ### The perceptron rule needs targets that hidden units do not have
+#
+# Notebook 07's perceptron rule updates a unit by $\mathbf{w} \leftarrow \mathbf{w} + \eta\,(y - \hat y)\,\mathbf{x}$: it needs the **correct output $y$ of that unit**. For the output unit we have it — the label. For a hidden unit we don't: the data say what the network should output, never what $h_1$ or $h_2$ should be. Worse, there is no single right answer. AND(OR, NAND) and the DNF network of Checkpoint 1.1 both compute XOR with completely different hidden units, and swapping the two hidden units (with their output weights) gives yet another solution. When the network makes a mistake, which hidden unit is to blame, and how should it change? This is the **credit assignment problem**.
+#
+# **A little history.** Rosenblatt's perceptron (1958) learned only its output layer. In their 1969 book *Perceptrons*, Minsky and Papert analysed rigorously what such single-layer perceptrons can and cannot compute; for example, they showed that some global properties of an image, like parity of the number of active pixels, require units that look at the whole input. They knew multilayer networks were more powerful but saw no way to train them. The book is often blamed for a decline in neural-network research in the 1970s; how large its role was is debated. The way out was to make the units smooth, so that the chain rule gives every weight a useful gradient: **backpropagation**, popularized by Rumelhart, Hinton, and Williams in 1986 (the underlying reverse-mode differentiation had appeared earlier).
+
+# %% [markdown]
+# ## 6. The fix: smooth units, trained by gradient descent
+#
+# Replace every step with the **sigmoid** from notebook 09:
+#
+# $$\sigma(z) = \frac{1}{1 + e^{-z}}, \qquad \sigma'(z) = \sigma(z)\,\big(1 - \sigma(z)\big) > 0 \text{ for every } z.$$
+#
+# The derivative is never zero, so a small change of any weight changes the loss a little, and gradients flow through every layer.
+#
+# **Nothing is lost in what we can represent.** For $z \ne 0$, $\sigma(kz) \to \operatorname{step}(z)$ as $k \to \infty$: if $z > 0$, $e^{-kz} \to 0$; if $z < 0$, $e^{-kz} \to \infty$. So multiplying all weights and biases of a step network by a large $k$ and swapping steps for sigmoids gives a network that behaves like the step network, except within a thin margin around each line. We check it with the hand-built XOR weights:
+
+# %%
+def sigmoid_network(X, layers, k):
+    """The step network `layers` with every step(z) replaced by sigmoid(k z). Returns the output in (0, 1): (N,)."""
+    h = X
+    for W, b in layers:
+        h = torch.sigmoid(k * (h @ W.T + b))
+    return h.squeeze(1)
+
+
+for k in [1, 5, 50]:
+    p = sigmoid_network(X_xc, xor_layers, k)
+    agree = ((p > 0.5).long() == run_step_network(X_xc, xor_layers)).float().mean().item()
+    print(f"k = {k:2d}: outputs range [{p.min().item():.3f}, {p.max().item():.3f}], same label as the step network on {agree:.1%} of points")
+
+# %% [markdown]
+# With $k = 1$ the outputs are mushy and some labels change; by $k = 50$ the outputs are essentially 0 or 1 and every label matches the step network. So sigmoid networks can represent everything step networks can (up to thin margins near the lines), and unlike step networks they can be trained.
+#
+# ### Training a 2-2-1 sigmoid network
+#
+# The model is
+#
+# $$H = \sigma\big(X W^{(1)\top} + \mathbf{b}^{(1)}\big)\ \ (N, H), \qquad \text{logit} = H W^{(2)\top} + b^{(2)}\ \ (N, 1),$$
+#
+# with $H$ hidden units, trained with binary cross-entropy on the logit (`nn.BCEWithLogitsLoss`, notebook 09) and plain full-batch gradient descent. We write it with `nn.Sequential`, which chains modules so that `model(X)` applies them in order, and `nn.Sigmoid`, the elementwise sigmoid as a module. Chapter 3 builds such networks from scratch (notebook 13), derives how autograd gets the hidden-layer gradients (backpropagation, notebook 14), and switches to the ReLU activation, which trains better in deep networks.
+#
+# The training loop is notebook 06's standard step, unchanged.
+
+# %%
+def train_sigmoid_net(X, y, hidden, seed, steps=3000, lr=2.0):
+    """Full-batch gradient descent on a 2-hidden-1 sigmoid network. Returns (model, list of losses)."""
+    torch.manual_seed(seed)                                      # seeds the random initialization
+    model = nn.Sequential(nn.Linear(2, hidden), nn.Sigmoid(), nn.Linear(hidden, 1))
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+    target = y.float().unsqueeze(1)                              # (N, 1), same shape as the logits
+    losses = []
+    for _ in range(steps):
+        optimizer.zero_grad()
+        loss = loss_fn(model(X), target)
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    return model, losses
+
+
+def accuracy(model, X, y):
+    with torch.no_grad():
+        return ((model(X).squeeze(1) > 0).long() == y).float().mean().item()
+
+
+net2, losses2 = train_sigmoid_net(X_xc, y_xc, hidden=2, seed=0)
+print(f"H = 2, seed 0: final loss {losses2[-1]:.4f}, training accuracy {accuracy(net2, X_xc, y_xc):.1%}")
+with torch.no_grad():
+    print("learned W1:", net2[0].weight.round(decimals=2).tolist(), " b1:", net2[0].bias.round(decimals=2).tolist())
+    print("learned W2:", net2[2].weight.round(decimals=2).tolist(), " b2:", net2[2].bias.round(decimals=2).tolist())
+
+# %% [markdown]
+# `net2[0]` is the first `nn.Linear` (weight shape `(2, 2)`, the $(\text{out}, \text{in})$ layout), `net2[1]` the sigmoid, `net2[2]` the output layer (weight `(1, 2)`). Gradient descent found weights that classify the training data — including weights for the hidden layer, which Section 5 showed a step network can never get.
+#
+# What did the hidden units learn? Each hidden unit $j$ is $\sigma(\mathbf{w}_j\cdot\mathbf{x} + b_j)$, which is $0.5$ on the line $\mathbf{w}_j\cdot\mathbf{x} + b_j = 0$ and saturates away from it — a soft version of a step unit's line. We draw those lines in input space, and the data in the learned hidden space $(h_1, h_2) \in (0, 1)^2$ with the output unit's line $\mathbf{w}^{(2)}\cdot\mathbf{h} + b^{(2)} = 0$.
+
+# %%
+def plot_trained_net(model, X, y, axes, name):
+    """Left: decision regions with the hidden units' 0.5-lines. Right: data in hidden space with the output line."""
+    W1, b1 = model[0].weight.detach(), model[0].bias.detach()
+    W2, b2 = model[2].weight.detach()[0], model[2].bias.detach()[0]
+    ax1, ax2 = axes
+    plot_decision_boundary(lambda Z: torch.sigmoid(model(Z).squeeze(1)), X, y, ax=ax1, kind="prob",
+                           title=f"{name}: input space")
+    lims = ax1.get_xlim(), ax1.get_ylim()
+    for j in range(W1.shape[0]):
+        draw_unit_line(ax1, W1[j], b1[j], COLORS[2 + j], f"hidden unit {j + 1}", center=(0.5, 0.5))
+    ax1.set_xlim(*lims[0])
+    ax1.set_ylim(*lims[1])
+    ax1.legend(loc="lower left", fontsize=7)
+    with torch.no_grad():
+        Hh = model[1](model[0](X))                                # (N, 2) hidden representation
+    plot_dataset(Hh, y, ax=ax2, s=10, title=f"{name}: hidden space")
+    draw_unit_line(ax2, W2, b2, "k", "output unit: logit = 0", center=(0.5, 0.5))
+    ax2.set_xlim(-0.05, 1.05)
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.set_xlabel("$h_1$")
+    ax2.set_ylabel("$h_2$")
+    ax2.legend(loc="lower left", fontsize=7)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+plot_trained_net(net2, X_xc, y_xc, axes, "trained H = 2, seed 0")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# Gradient descent found a *different* network from ours that computes the same function. Both hidden units' lines run parallel to $x_1 + x_2 = \text{const}$, like the hand-built OR and NAND lines, but both arrows point toward the origin: hidden unit 1 fires below the lower line (roughly NOR, "neither input on") and hidden unit 2 below the upper line (roughly NAND). In hidden space the four clusters collapse onto three corners of the square: the $(0,0)$ cluster near $(1, 1)$, both class-1 clusters near $(0, 1)$, and the $(1,1)$ cluster near $(0, 0)$. The output line cuts off the corner $(0, 1)$. Because the units are soft, points between clusters land along the edges of the square rather than exactly on its corners.
+
+# %% [markdown]
+# ### Checkpoint 6.1
+#
+# Compute the hidden representation `H_corners` (shape `(4, 2)`) of the four exact corners `X4` in the trained network `net2`, using its first layer's weight and bias and `torch.sigmoid` — not by calling `net2`. Then compute the network's predicted labels `pred_corners` (shape `(4,)`, integers) on `X4`. Do both inside `torch.no_grad()`.
+
+# %% [markdown] tags=["hint"]
+# `torch.sigmoid(X4 @ net2[0].weight.T + net2[0].bias)`. For labels, the logit is positive exactly when the probability exceeds 0.5: `(net2(X4).squeeze(1) > 0).long()`.
+
+# %%
+with torch.no_grad():
+    # BEGIN SOLUTION
+    H_corners = torch.sigmoid(X4 @ net2[0].weight.T + net2[0].bias)
+    pred_corners = (net2(X4).squeeze(1) > 0).long()
+    # END SOLUTION
+print("hidden representation of the corners:", H_corners.round(decimals=3).tolist())
+
+# %% tags=["check"]
+check_shape(H_corners, (4, 2), "H_corners")
+with torch.no_grad():
+    check_close(H_corners, net2[1](net2[0](X4)), "H_corners")
+check(torch.equal(pred_corners.long(), y4_xor), "the trained network should compute XOR on the four corners")
+passed("Checkpoint 6.1")
+
+# %% [markdown]
+# ### Training does not always succeed
+#
+# The run above used seed 0 for the random initialization. Gradient descent on this loss is not guaranteed to find a good minimum: the loss of a network with hidden units is **not** a convex bowl like notebook 06's. We train from 10 random initializations with $H = 2$ and with $H = 8$ hidden units, same data, same learning rate and number of steps, and call a run successful if training accuracy exceeds 95%.
+
+# %%
+SEEDS = range(10)
+runs = {}
+for hidden in [2, 8]:
+    runs[hidden] = [train_sigmoid_net(X_xc, y_xc, hidden, seed) for seed in SEEDS]
+    accs_h = [accuracy(model, X_xc, y_xc) for model, _ in runs[hidden]]
+    print(f"H = {hidden}: training accuracy per seed {[f'{a:.2f}' for a in accs_h]}  ->  {sum(a > 0.95 for a in accs_h)}/10 succeed")
+
+# %%
+fail_seed = next(s for s, (m, _) in zip(SEEDS, runs[2]) if accuracy(m, X_xc, y_xc) <= 0.95)
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
+plot_trained_net(runs[2][fail_seed][0], X_xc, y_xc, axes[:2], f"failed H = 2, seed {fail_seed}")
+for hidden, color in [(2, COLORS[0]), (8, COLORS[1])]:
+    for i, (_, losses) in enumerate(runs[hidden]):
+        axes[2].semilogy(losses, color=color, alpha=0.6, label=f"H = {hidden}" if i == 0 else None)
+axes[2].set_xlabel("gradient-descent step")
+axes[2].set_ylabel("training BCE (log scale)")
+axes[2].set_title("Loss curves, 10 seeds each")
+axes[2].legend()
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# The failed run (seed 3) placed its two hidden lines **across** each other near $(0.55, 0)$ instead of along the diagonal. Its output is close to 0.5 on two of the four clusters — the class-1 cluster at $(0, 1)$ and the class-0 cluster at $(1, 1)$ — so one of them is misclassified (accuracy 72%). Two clusters at probability 0.5 contribute $\tfrac{2}{4}\ln 2 \approx 0.35$ to the mean loss, which is exactly the height of the plateau where the four failed $H = 2$ curves (right) stay stuck. Every run starts on a plateau at $\ln 2 \approx 0.69$, where all outputs are near 0.5. With $H = 2$ some runs need a thousand steps to leave it; with $H = 8$ every run leaves it within a few hundred steps and keeps improving.
+
+# %% [markdown]
+# ## Exercises
+
+# %% [markdown]
+# ### Exercise 1 (modify): from XOR to XNOR
+#
+# XNOR is the negation of XOR: output 1 when the inputs are **equal**. Starting from the hand-built XOR network (`W1_xor`, `b1_xor`, `W2_xor`, `b2_xor`), change as few numbers as you can to get XNOR, and store the result as `xnor_layers`. Then answer in the markdown cell below:
+#
+# 1. Which numbers did you change, and why does that negate the output? (Think about $\operatorname{step}(-z)$ versus $1 - \operatorname{step}(z)$, and when they differ.)
+# 2. Describe the XNOR region in the input plane, as drawn by the plot. Is it convex? Which kind of output unit — AND or OR of half-planes — does it correspond to?
+# 3. Give a different XNOR network whose hidden units are other gates from the table in Section 1 (or NOR).
+
+# %% [markdown] tags=["hint"]
+# Negating the output unit's weights and bias turns $\operatorname{step}(z)$ into $\operatorname{step}(-z)$, which equals $1 - \operatorname{step}(z)$ whenever $z \ne 0$. On the four corners the output unit's $z$ is $\pm 0.5$ or $-1.5$, never 0.
+
+# %%
+# BEGIN SOLUTION
+xnor_layers = [(W1_xor, b1_xor), (-W2_xor, -b2_xor)]   # output unit becomes NAND(h1, h2)
+# END SOLUTION
+print("XNOR network on 00, 01, 10, 11:", run_step_network(X4, xnor_layers).tolist())
+fig, ax = plt.subplots(figsize=(5, 4.6))
+plot_decision_boundary(lambda P_: run_step_network(P_, xnor_layers), X4, 1 - y4_xor, ax=ax, padding=0.5,
+                       title="Your XNOR network's regions")
+plt.show()
+
+# %% tags=["check"]
+check(torch.equal(run_step_network(X4, xnor_layers), torch.tensor([1, 0, 0, 1])), "the network should compute XNOR")
+passed("Exercise 1")
+
+# %% [markdown]
+# *Your answer:*
+
+# %% [markdown] tags=["solution"]
+# 1. Negating the output unit's weights and bias, $W^{(2)} = (-1, -1)$, $b^{(2)} = 1.5$, turns the output from AND$(h_1, h_2)$ into NAND$(h_1, h_2)$. In general $\operatorname{step}(-z) = 1 - \operatorname{step}(z)$ for $z \ne 0$; at $z = 0$ both are 0, so negation by flipping signs works only if no input lands exactly on the output unit's threshold. On the corners the output's $z = h_1 + h_2 - 1.5$ is $\pm 0.5$, so it is safe — another reason to use half-integer biases.
+# 2. The XNOR region is the complement of XOR's band: everything below $x_1 + x_2 = 0.5$ **or** above $x_1 + x_2 = 1.5$. It is the union of two half-planes, which is not convex (the segment from $(0,0)$ to $(1,1)$ crosses the excluded band). Indeed NAND$(h_1, h_2)$ = OR(NOT $h_1$, NOT $h_2$) = OR(NOR-side, AND-side): an OR of half-planes.
+# 3. Make that explicit: hidden units AND $(\mathbf{w} = (1,1), b = -1.5)$ and NOR $(\mathbf{w} = (-1,-1), b = 0.5)$, output OR $(\mathbf{w} = (1, 1), b = -0.5)$. This is the DNF construction of Section 2 for the truth table 1001.
+
+# %% [markdown]
+# ### Exercise 2 (implement): a detector for any convex polygon
+#
+# Write `polygon_detector(vertices)` that takes the vertices of a convex polygon as a `(K, 2)` tensor in **counterclockwise** order and returns `(W, b)` with `W` of shape `(K, 2)` and `b` of shape `(K,)`: one step unit per edge, firing on the polygon's side of that edge. Then `step(X @ W.T + b)` is all ones exactly for points inside, and an AND output unit detects the polygon.
+#
+# For the edge from vertex $\mathbf{v}_k$ to $\mathbf{v}_{k+1}$ (wrapping around, so the last edge goes back to $\mathbf{v}_0$), with direction $\mathbf{e} = \mathbf{v}_{k+1} - \mathbf{v}_k = (e_1, e_2)$: walking counterclockwise, the inside is on the **left**, and the left-pointing normal is $\mathbf{n} = (-e_2, e_1)$. A point $\mathbf{x}$ is on the inner side when $\mathbf{n}\cdot(\mathbf{x} - \mathbf{v}_k) > 0$. Read off $\mathbf{w}$ and $b$ from that.
+#
+# The check compares your detector with a point-in-polygon test from `matplotlib` on a square and a regular pentagon, at 5,000 random points each.
+
+# %% [markdown] tags=["hint"]
+# `vertices.roll(-1, dims=0)` gives $\mathbf{v}_{k+1}$ for every $k$ at once (shape `(K, 2)`). Then `E = next - vertices`, `W = torch.stack([-E[:, 1], E[:, 0]], dim=1)`, and $b_k = -\mathbf{n}_k\cdot\mathbf{v}_k$, which is `-(W * vertices).sum(dim=1)`.
+
+# %%
+def polygon_detector(vertices):
+    # BEGIN SOLUTION
+    edges = vertices.roll(-1, dims=0) - vertices                 # (K, 2): v_{k+1} - v_k
+    W = torch.stack([-edges[:, 1], edges[:, 0]], dim=1)          # (K, 2): left (inward) normals
+    b = -(W * vertices).sum(dim=1)                               # (K,): -n_k · v_k
+    return W, b
+    # END SOLUTION
+
+# %% tags=["check"]
+def _inside_by_detector(vertices, X):
+    W, b = polygon_detector(vertices)
+    check_shape(W, (len(vertices), 2), "W")
+    check_shape(b, (len(vertices),), "b")
+    return (step(X @ W.T + b).sum(dim=1) == len(vertices)).long()
+
+
+_square = torch.tensor([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]])
+_angles = 2 * math.pi * torch.arange(5) / 5 + 0.3
+_pentagon = torch.stack([0.8 * torch.cos(_angles), 0.8 * torch.sin(_angles) + 0.1], dim=1)
+_gen = torch.Generator().manual_seed(5)
+for _name, _poly in [("square", _square), ("pentagon", _pentagon)]:
+    _X = 2 * torch.rand(5000, 2, generator=_gen) - 1
+    _ref = torch.from_numpy(PolygonPath(_poly.numpy()).contains_points(_X.numpy())).long()
+    _mine = _inside_by_detector(_poly, _X)
+    check(torch.equal(_mine, _ref), f"{_name}: detector disagrees with the reference on {int((_mine != _ref).sum())} points")
+passed("Exercise 2")
+
+# %% [markdown]
+# ### Exercise 3 (debug): a broken XOR network
+#
+# Someone hand-built the AND(OR, NAND) network below, but its truth table is wrong. The buggy version is in the comments; it contains **two** bugs in the hidden layer. Find both, and write the corrected `W1` and `b1` (keep the output layer). The cell after the check shows what the buggy network does.
+
+# %% [markdown] tags=["hint"]
+# Remember that `run_step_network` computes `X @ W.T + b`, so row $j$ of `W1` must hold the weights of hidden unit $j$ — `nn.Linear`'s `(out, in)` layout. Then evaluate each hidden unit on all four inputs by hand: does the NAND unit ever fire?
+
+# %%
+def fixed_xor_layers():
+    # Buggy version:
+    #     W1 = torch.tensor([[1.0, -1.0],     # column 0: OR weights, column 1: NAND weights
+    #                        [1.0, -1.0]])
+    #     b1 = torch.tensor([-0.5, -1.5])
+    # BEGIN SOLUTION
+    W1 = torch.tensor([[1.0, 1.0],          # row 0: OR
+                       [-1.0, -1.0]])       # row 1: NAND
+    b1 = torch.tensor([-0.5, 1.5])          # NAND fires when x1 + x2 < 1.5
+    # END SOLUTION
+    W2 = torch.tensor([[1.0, 1.0]])
+    b2 = torch.tensor([-1.5])
+    return [(W1, b1), (W2, b2)]
+
+# %% tags=["check"]
+_layers = fixed_xor_layers()
+check(torch.equal(run_step_network(X4, _layers), y4_xor), "the network should compute XOR on the four corners")
+_P = 3 * torch.rand(3000, 2, generator=torch.Generator().manual_seed(3)) - 1
+_band = ((_P.sum(dim=1) > 0.5) & (_P.sum(dim=1) < 1.5)).long()
+check(torch.equal(run_step_network(_P, _layers), _band), "on real-valued inputs, the output should fire exactly in the band 0.5 < x1 + x2 < 1.5")
+passed("Exercise 3")
+
+# %%
+def buggy_layers(transposed=True, bias_sign=True):
+    W1 = torch.tensor([[1.0, -1.0], [1.0, -1.0]]) if transposed else torch.tensor([[1.0, 1.0], [-1.0, -1.0]])
+    b1 = torch.tensor([-0.5, -1.5]) if bias_sign else torch.tensor([-0.5, 1.5])
+    return [(W1, b1), (W2_xor, b2_xor)]
+
+
+print("XOR:                      ", y4_xor.tolist())
+for transposed, bias_sign, label in [(True, True, "both bugs"), (False, True, "bias-sign bug only"), (True, False, "layout bug only")]:
+    L = buggy_layers(transposed, bias_sign)
+    print(f"{label:26s}", run_step_network(X4, L).tolist(), "  hidden:", step(X4 @ L[0][0].T + L[0][1]).long().tolist())
+
+# %% [markdown] tags=["solution"]
+# **Bug 1 (layout).** The author wrote each unit's weights as a **column**, the `(in, out)` layout, but `X @ W.T` reads each **row** as a unit. With the columns $(1, 1)$ and $(-1, -1)$ written side by side, the rows are $(1, -1)$ and $(1, -1)$: both hidden units compute $x_1 - x_2 + b$, which has nothing to do with OR or NAND. `nn.Linear` stores `(out, in)`; when writing weights by hand, write one row per unit.
+#
+# **Bug 2 (bias sign).** NAND fires when $x_1 + x_2 < 1.5$, i.e. $-x_1 - x_2 + 1.5 > 0$: bias $+1.5$. With $-1.5$, the unit computes $-x_1 - x_2 - 1.5 < 0$ for every input in $[0,1]^2$ and never fires, so the AND output is always 0.
+#
+# The table shows each bug's effect. With the bias bug alone, the NAND unit is dead and the output is 0 everywhere: rows $(0,1)$ and $(1,0)$ are wrong. With the layout bug alone, both units look at $x_1 - x_2$, and the output fires only for $(1, 0)$: row $(0,1)$ is wrong. With both bugs, the second unit $x_1 - x_2 - 1.5$ never fires on the corners, and again the output is all zeros. Each bug alone produces 1 or 2 wrong rows; a truth-table check catches both, but a check on just one input might not.
+
+# %% [markdown]
+# ### Exercise 4 (investigate): how does hidden width affect trainability?
+#
+# Section 6 found that a sigmoid network with $H = 2$ hidden units sometimes fails to learn the noisy XOR corners while $H = 8$ succeeded on every seed tried. Investigate this more systematically, on two datasets:
+#
+# - **corners**: the noisy XOR corners `X_xc, y_xc` from Sections 5–6;
+# - **quadrants**: `make_xor(n=400, noise=0.05)`, points uniform on $[-1, 1]^2$ with class 1 in the first and third quadrants (class 1 where $x_1 x_2 > 0$). This is also "XOR" — of the signs of $x_1$ and $x_2$ — but the classes fill whole quadrants instead of small clusters.
+#
+# The scaffold trains $H \in \{1, 2, 3, 4, 8\}$ with 10 seeds each (same learning rate and steps as Section 6) and plots the fraction of seeds reaching more than 95% training accuracy. It takes about 15 seconds. Run it, then answer:
+#
+# 1. Why can $H = 1$ never succeed on either dataset? (What does the decision region of a network with one hidden sigmoid unit look like?)
+# 2. On the corners, $H = 2$ is enough to *represent* a solution (the hand-built network, made smooth as in Section 6). What does its success rate say about *learning*? What changes with larger $H$?
+# 3. On the quadrants, what is the best accuracy any $H = 2$ run reaches? Look at the decision regions of the best $H = 2$ run. Is the failure about optimization or about representation? Try to argue why.
+# 4. Which of your conclusions are proven and which are empirical observations for this data, learning rate, and number of steps?
+
+# %% [markdown] tags=["hint"]
+# With one hidden unit the logit is $v\,\sigma(\mathbf{w}\cdot\mathbf{x} + b) + c$, a monotone function of the single number $\mathbf{w}\cdot\mathbf{x} + b$. For question 3: with two hidden units, moving $\mathbf{x}$ in a direction that increases both $\mathbf{w}_1\cdot\mathbf{x}$ and $\mathbf{w}_2\cdot\mathbf{x}$ can only push the logit one way for each unit. Could such a function produce four alternating quadrants?
+
+# %%
+X_quad, y_quad = make_xor(n=400, noise=0.05, seed=0)            # (400, 2), (400,)
+datasets = {"corners": (X_xc, y_xc), "quadrants": (X_quad, y_quad)}
+widths = [1, 2, 3, 4, 8]
+results = {}                                                     # (dataset, H) -> list of (accuracy, model)
+for name, (X_d, y_d) in datasets.items():
+    for hidden in widths:
+        results[name, hidden] = [(accuracy(m, X_d, y_d), m) for m, _ in (train_sigmoid_net(X_d, y_d, hidden, s) for s in SEEDS)]
+        accs_d = [a for a, _ in results[name, hidden]]
+        print(f"{name:9s} H = {hidden}: success {sum(a > 0.95 for a in accs_d):2d}/10, best accuracy {max(accs_d):.3f}, median {sorted(accs_d)[5]:.3f}")
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+for name, color in [("corners", COLORS[0]), ("quadrants", COLORS[1])]:
+    rates = [sum(a > 0.95 for a, _ in results[name, hidden]) / 10 for hidden in widths]
+    axes[0].plot(widths, rates, "o-", color=color, label=name)
+axes[0].set_xlabel("hidden units H")
+axes[0].set_ylabel("fraction of 10 seeds with accuracy > 95%")
+axes[0].set_title("Trainability vs. width (3000 steps, lr = 2)")
+axes[0].legend()
+best_acc, best_model = max(results["quadrants", 2], key=lambda am: am[0])
+plot_decision_boundary(lambda Z: torch.sigmoid(best_model(Z).squeeze(1)), X_quad, y_quad, ax=axes[1], kind="prob",
+                       title=f"Best H = 2 run on quadrants ({best_acc:.1%})")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# *Your conclusion:*
+
+# %% [markdown] tags=["solution"]
+# 1. **$H = 1$ (proved).** The logit is $v\,\sigma(\mathbf{w}\cdot\mathbf{x} + b) + c$, a monotone function of the single number $\mathbf{w}\cdot\mathbf{x} + b$. Its decision region is therefore a half-plane, and notebook 08 proved no half-plane separates XOR: at most 3 of the 4 corner clusters can be right. The measured best accuracy, 0.750 on the corners, is exactly that limit.
+# 2. **Corners.** $H = 2$ can represent a solution, yet only 6 of 10 seeds found one; the others got stuck on a plateau with two clusters near probability 0.5. Representation guarantees that good weights exist, not that gradient descent reaches them from every initialization. With $H = 3$ or more, every seed succeeded: extra units give gradient descent more ways to reach *some* good solution.
+# 3. **Quadrants.** The best $H = 2$ run reaches only 84.5%, using a diagonal band: two parallel lines with class 1 between them. This is a limit of **representation**, not just optimization. If $\mathbf{w}_1$ and $\mathbf{w}_2$ are parallel, the logit depends on one projection $t = \mathbf{u}\cdot\mathbf{x}$ only, so the boundary is a set of lines perpendicular to $\mathbf{u}$ — at most two, giving a band. If they are not parallel, use $a_1 = \mathbf{w}_1\cdot\mathbf{x} + b_1$ and $a_2 = \mathbf{w}_2\cdot\mathbf{x} + b_2$ as coordinates: the boundary $v_1\sigma(a_1) + v_2\sigma(a_2) + c = 0$ can be solved for $a_2$ as a monotone function of $a_1$, so it is a single monotone curve. Neither a band nor one monotone curve can produce four quadrants with alternating classes, whose boundary is two crossing lines. With $H = 4$, half the seeds succeed; with $H = 8$, all do, and the best accuracy is 0.967 — the label noise near the axes (points jittered across a quadrant boundary after labelling) prevents 100%.
+# 4. **Proved:** $H = 1$ cannot solve either dataset; $H = 2$ cannot represent the quadrant pattern exactly (the argument above). **Empirical, for this data, learning rate 2, and 3000 steps:** the success rates, the fact that wider networks succeeded more often, and the exact width at which success became reliable. Different learning rates, step counts, or initializations would change those numbers.
+
+# %% [markdown]
+# ## Summary and what's next
+#
+# - Feeding perceptrons into perceptrons gives **networks**. A hidden layer **transforms the data** into a representation where a linear output unit suffices: XOR = AND(OR, NAND) maps the four inputs to three hidden points that one line separates.
+# - **Any Boolean function** is computed by a two-layer step network (disjunctive normal form: one AND detector per true pattern, then OR). The recipe can need up to $2^n$ hidden units; smarter constructions can be far smaller (parity: $n$ units instead of $2^{n-1}$), but for most functions exponential size is unavoidable (stated without proof).
+# - In the plane, a step unit is a half-plane. AND of half-planes gives a **convex polygon**; OR gives unions; **two hidden layers** give any polygonal region. One hidden layer can represent many non-convex regions (we built a square with a hole), but there is no general recipe and some regions are out of reach.
+# - Curved boundaries, like the circle between `make_rings`' rings, can only be approximated by polygons; $k$ units give a $k$-gon whose corners stay within a factor $1/\cos(\pi/k)$ of the circle.
+# - Step networks **cannot be trained by gradient descent**: the step's derivative is zero wherever it exists, so hidden weights get no signal, and the perceptron rule has no targets for hidden units (credit assignment).
+# - Replacing steps by **sigmoids** keeps the representational power (σ(kz) → step(z)) and makes every weight trainable. A 2-2-1 sigmoid network learns XOR from data — but not from every initialization; wider networks failed less often in our runs.
+#
+# We now know networks can represent any Boolean function and any polygonal region exactly. What about **arbitrary continuous functions**, like a regression curve or a smoothly curved boundary? How many units does a given accuracy need, and does **depth** help more than width? And does being able to *represent* a function mean we can *learn* it, and that it will *generalize* to new data? Notebook 12 takes these up with ReLU units and the universal approximation theorem.

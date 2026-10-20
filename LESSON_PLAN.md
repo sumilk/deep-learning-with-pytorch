@@ -90,9 +90,10 @@ Distinguish **representing a function**, **learning it through optimization**, a
 **Tricky problems:** XOR with misleading features, concentric rings, checkerboards, and models that interpolate training data but fail between samples.
 
 **Chapter problem set:**
-- Hand-construct network weights that solve XOR and a 4-region checkerboard, with no training.
-- Implement softmax cross-entropy naively and stably; find inputs where the naive version returns `nan`.
-- Investigate: how many ReLU units are needed to approximate `sin(x)` on an interval to a given error, and how does that change with depth?
+- Hand-construct a three-layer step network that classifies a 16-tile checkerboard exactly, using parity as a linear function of ordered threshold units.
+- Implement Newton's method for logistic regression; compare its quadratic convergence with gradient descent and explain why it does not scale to networks.
+- Debug a multiclass classifier whose loss stays at ln K because shuffling decoupled inputs from labels.
+- Investigate: constructed versus trained one-hidden-layer ReLU networks approximating `sin(x)`; how the gap grows with width, and how much seeds differ.
 
 ## Chapter 3. MLPs and backpropagation in depth
 

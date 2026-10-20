@@ -8,7 +8,7 @@ A gradual, visual, hands-on course: tensors and perceptrons → MLPs → GPU tra
 2. Set up the environment (below).
 3. Open [notebooks/ch01_foundations/00_course_guide.ipynb](notebooks/ch01_foundations/00_course_guide.ipynb).
 
-**Status:** Chapter 1 (notebooks 00–06 and its problem set) is written and validated. Later chapters are in progress.
+**Status:** Chapters 1–2 (notebooks 00–12 and their problem sets) are written and validated. Later chapters are in progress.
 
 ## Setup
 

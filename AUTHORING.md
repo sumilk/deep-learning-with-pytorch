@@ -105,6 +105,9 @@ Notebooks may add imports after this cell, but never change it.
 
 ## Compute and data
 
+- Use the shared generators in `dlcourse.data` (`make_blobs`, `make_xor`, `make_rings`, `make_spirals`, `make_checkerboard`) rather than writing new ones, so datasets recur across notebooks. Each takes a `seed`.
+- Use `dlcourse.plotting.plot_dataset` and `plot_decision_boundary` for 2-D classification plots.
+
 - The CPU core of each notebook should execute in under 3 minutes on a laptop.
 - CPU core sections use generated or committed data only; no downloads.
 - GPU cells select the device with `dlcourse.get_device()` and skip with a printed message when `device.type == "cpu"`. They must not fail on CPU-only machines.
