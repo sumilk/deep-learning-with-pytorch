@@ -28,10 +28,18 @@ Outputs:
 - ``notebooks/<chapter>/<notebook>.ipynb`` — student version.
 - ``solutions/<chapter>/<notebook>.ipynb`` — solution version.
 
+Each notebook is executed from a fresh kernel and saved **with its outputs**,
+so figures are visible without running anything. In student notebooks the
+outputs of ``exercise`` and ``check`` cells are cleared (they would only show
+the unfinished-exercise errors). A notebook is re-executed only when its
+cells change, or with ``--force``.
+
 Usage:
 
-    uv run python scripts/build_notebooks.py           # build everything
-    uv run python scripts/build_notebooks.py --check   # fail if outputs are stale
+    uv run python scripts/build_notebooks.py               # build and execute what changed
+    uv run python scripts/build_notebooks.py --force       # re-execute everything
+    uv run python scripts/build_notebooks.py --no-execute  # write notebooks without outputs
+    uv run python scripts/build_notebooks.py --check       # fail if any notebook's cells are stale
     uv run python scripts/build_notebooks.py --match 01_tensors
 """
 
@@ -42,6 +50,7 @@ import sys
 from pathlib import Path
 
 import nbformat
+from nbclient import NotebookClient
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -147,7 +156,43 @@ def render(cells, student, path):
     # Deterministic cell ids keep rebuilds diff-free.
     for index, cell in enumerate(nb.cells):
         cell.id = f"cell-{index:03d}"
-    return nbformat.writes(nb) + "\n"
+    return nb
+
+
+def without_outputs(nb):
+    """Serialized notebook with outputs removed: what --check and change detection compare."""
+    nb = nbformat.from_dict(json.loads(nbformat.writes(nb)))
+    nb.metadata.pop("language_info", None)
+    nb.metadata["language_info"] = {"name": "python"}
+    for cell in nb.cells:
+        if cell.cell_type == "code":
+            cell.outputs = []
+            cell.execution_count = None
+            cell.metadata.pop("execution", None)
+    return nbformat.writes(nb)
+
+
+ALLOWED_STUDENT_ERRORS = {"NotImplementedError", "NameError"}
+
+
+def execute(nb, path, student):
+    """Run nb in a fresh kernel from path's folder; clean up outputs for publishing."""
+    client = NotebookClient(nb, timeout=900, kernel_name="python3", allow_errors=student,
+                            resources={"metadata": {"path": str(path.parent)}})
+    client.execute()
+    for index, cell in enumerate(nb.cells):
+        if cell.cell_type != "code":
+            continue
+        cell.metadata.pop("execution", None)
+        tags = set(cell.metadata.get("tags", []))
+        if student and tags & {"exercise", "check"}:
+            cell.outputs = []
+            cell.execution_count = None
+            continue
+        for output in cell.outputs:
+            if output.get("output_type") == "error":
+                raise SystemExit(f"{path}: cell {index} raised {output.get('ename')} in a teaching cell")
+    return nb
 
 
 def targets(source):
@@ -157,25 +202,36 @@ def targets(source):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--check", action="store_true", help="exit non-zero if any built notebook is out of date")
+    parser.add_argument("--check", action="store_true", help="exit non-zero if any built notebook's cells are out of date")
     parser.add_argument("--match", default="", help="only build sources whose path contains this text")
+    parser.add_argument("--force", action="store_true", help="re-execute notebooks even if their cells are unchanged")
+    parser.add_argument("--no-execute", action="store_true", help="write notebooks without executing them")
     args = parser.parse_args()
 
     sources = [s for s in sorted(SRC.glob("*/*.py")) if args.match in str(s.relative_to(SRC))]
     if not sources:
         raise SystemExit(f"no sources found under {SRC}")
-    stale = []
+    stale, written = [], 0
     for source in sources:
         cells = parse_cells(source.read_text(), source)
         student_path, solution_path = targets(source)
         for path, student in ((student_path, True), (solution_path, False)):
-            content = render(cells, student, source)
-            if path.exists() and path.read_text() == content:
+            nb = render(cells, student, source)
+            existing = nbformat.read(path, as_version=4) if path.exists() else None
+            unchanged = existing is not None and without_outputs(existing) == without_outputs(nb)
+            has_outputs = existing is not None and any(c.get("outputs") for c in existing.cells if c.cell_type == "code")
+            if args.check:
+                if not unchanged:
+                    stale.append(path)
                 continue
-            stale.append(path)
-            if not args.check:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content)
+            if unchanged and not args.force and (has_outputs or args.no_execute):
+                continue
+            if not args.no_execute:
+                print(f"executing {path.relative_to(ROOT)}", flush=True)
+                execute(nb, path, student)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(nbformat.writes(nb) + "\n")
+            written += 1
     if args.check:
         if stale:
             print("Out-of-date notebooks (run scripts/build_notebooks.py):")
@@ -184,7 +240,7 @@ def main():
             sys.exit(1)
         print(f"All {2 * len(sources)} notebooks are up to date.")
     else:
-        print(f"Built {len(sources)} sources; {len(stale)} notebooks written.")
+        print(f"Built {len(sources)} sources; {written} notebooks written.")
 
 
 if __name__ == "__main__":

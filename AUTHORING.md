@@ -5,11 +5,11 @@ How course notebooks are written, built, and validated. Read [LESSON_PLAN.md](LE
 ## Workflow
 
 1. Edit the source in `src/<chapter>/<notebook>.py`. Never edit the generated `.ipynb` files.
-2. Build: `uv run python scripts/build_notebooks.py`. This writes the student notebook to `notebooks/` and the solution notebook to `solutions/`.
+2. Build: `uv run python scripts/build_notebooks.py`. This writes the student notebook to `notebooks/` and the solution notebook to `solutions/`, executes each from a fresh kernel, and saves the outputs. Only notebooks whose cells changed are re-executed; `--force` re-executes everything.
 3. Validate: `uv run python scripts/validate_notebooks.py <chapter>`. Both variants run from a fresh kernel; results go to `VALIDATION.md`.
 4. Commit the source, both generated notebooks, and `VALIDATION.md` together.
 
-Generated notebooks are committed without outputs.
+Generated notebooks are committed **with outputs**, so figures are visible without running anything. In student notebooks, the outputs of `exercise` and `check` cells are cleared. Outputs reflect the machine that built them (the setup cell prints its device); rebuild with `DLCOURSE_DEVICE=cpu` to produce CPU-only outputs.
 
 ## Source format
 
