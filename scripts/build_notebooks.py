@@ -226,10 +226,10 @@ def main():
                 continue
             if unchanged and not args.force and (has_outputs or args.no_execute):
                 continue
+            path.parent.mkdir(parents=True, exist_ok=True)
             if not args.no_execute:
                 print(f"executing {path.relative_to(ROOT)}", flush=True)
                 execute(nb, path, student)
-            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(nbformat.writes(nb) + "\n")
             written += 1
     if args.check:

@@ -2,7 +2,7 @@
 
 Proposed curriculum: **65 notebooks**, numbered **00–64**, organized into **11 chapters**, plus one **problem-set notebook per chapter**.
 
-Status: proposed plan awaiting review. No tutorial notebooks have been written yet.
+Status: Chapters 1–3 are implemented; later chapters are in progress. The requirements below apply to new chapters and revisions.
 
 ## Goals and prerequisites
 
@@ -48,9 +48,35 @@ Exercises are spread through each notebook and each chapter, not saved for the e
 
 1. **Inline checkpoints:** after each concept, one or two short tasks such as predicting a shape, filling in one line, or explaining a plot. Each has an `assert`-based check that gives immediate feedback.
 2. **End-of-notebook exercises:** progressing through **modify → implement → debug → investigate**. "Debug" exercises include deliberately broken code. "Investigate" exercises ask an open question answered with an experiment and a short written conclusion.
-3. **Chapter problem set:** a separate notebook per chapter (`chNN_problems.ipynb`) that combines the chapter's ideas into larger problems. It includes a debugging problem, a small experiment with a written analysis, and optionally a **[GPU]** problem.
+3. **Chapter problem set:** a separate notebook per chapter (`chNN_problems.ipynb`) that combines the chapter's ideas into larger problems. It includes a debugging problem, a small experiment with a written analysis, one independent mini-capstone (specified below), and optionally a **[GPU]** problem.
 
 Implementation exercises ship with automated checks: shape and value tests, comparisons against PyTorch reference implementations, and `gradcheck` where applicable. Hints and worked solutions live in separate solution notebooks so learners can attempt problems first.
+
+### Independent practice and rigor in every chapter
+
+- Fade scaffolding: early investigations may supply a complete experiment; later investigations leave sampling/training loops, aggregation, or plots for learners to implement. At least one investigation per chapter must require learner-written experiment code, not only running supplied code and explaining a plot.
+- Each chapter ends with an independent mini-capstone inside its problem set, distinct from Chapter 11's larger projects. Supply the task, data contract, evaluation criteria, and CPU budget; leave the experimental implementation and plots to the learner. Allow 1–2 additional hours beyond the guided problems.
+- Before execution, learners record a prediction and justify their variables, controls, metrics, and seed/sample-size choices. Require an independent numerical or behavioral reference, a deliberately difficult or failure case, and a written report comparing predictions with measured evidence, uncertainty, limitations, and a follow-up experiment.
+- Use multiple seeds and paired controls where randomness matters. Early chapters may report spread and individual runs; later chapters introduce confidence intervals and matched compute budgets. Explain what spread measures, and do not require noisy trends to be monotonic on every run.
+- Every coded task must have a check that actually calls the learner's implementation, and the original broken version must fail a debug task's check. Validate incomplete stubs separately from finished solutions. Runtime success alone does not establish exercise coverage or conceptual mastery.
+- Check boundaries as well as random inputs: ties, zero values, exact decision thresholds, singleton/non-square shapes, and large logits where applicable. Specify label/threshold conventions, and test agreement with the data generator on boundaries.
+- Present rules of thumb with their assumptions and at least one limitation or counterexample. For example, initial cross-entropy near ln K assumes approximately uniform predictions; an untrained classifier can fall below it by chance. Use shuffled labels or another appropriate negative control before interpreting a diagnostic as evidence of a bug.
+- Code checks assess stated numerical contracts. Written reports and plots use a visible rubric: prediction, controls, implementation verification, quantitative evidence across runs, failure analysis, limitations, and follow-up. Do not imply that passing code checks grades the written reasoning.
+
+Independent mini-capstone themes for the remaining chapters (adapt details to prerequisites):
+
+| Chapter | Independent task and evidence |
+| --- | --- |
+| 3 — MLPs | Diagnose an unfamiliar failed training run; propose a cause, verify gradients, and test one-factor fixes across seeds with matched updates. |
+| 4 — Reliable training | Design a leakage-free model comparison with a baseline, train-only preprocessing, uncertainty, and an untouched test set. |
+| 5 — GPU computing | Design a synchronized benchmark with warmup and CPU/reference correctness checks; locate a speed crossover and explain a case where GPU execution loses. |
+| 6 — CNNs | Choose and test an architectural hypothesis on procedural images; control parameters/compute and expose a shortcut or transformation failure. |
+| 7 — Sequence models | Compare sequence models at matched budgets; test length extrapolation or delayed recall with a task-specific chance baseline. |
+| 8 — Attention | Design an ablation that tests an attention mechanism; verify masking at exact boundaries and include a negative control for information leakage. |
+| 9 — Transformers | Test a positional or architectural hypothesis on a controlled task; compare seeds, verify causality, and measure an out-of-range failure. |
+| 10 — Modern systems | Choose a systems or adaptation tradeoff; verify numerical equivalence where claimed and report quality, memory, runtime, and a failure condition. |
+| 11 — Capstones | Apply the same rubric to the existing larger independent projects, including baselines, controls, uncertainty, and failure analysis. |
+
 
 ---
 
@@ -73,6 +99,7 @@ Implementation exercises ship with automated checks: shape and value tests, comp
 - Implement a custom `autograd.Function` for a numerically stable operation such as `softplus` and verify it with `gradcheck`.
 - Debug a training loop that forgets `zero_grad`, then a second loop with an in-place modification that breaks autograd.
 - Investigate: fit a Gaussian and a Laplace likelihood to data with outliers; explain how the loss (MSE vs. MAE) follows from the likelihood.
+- Independent mini-capstone: design a regression study across sample sizes, noise levels, and seeds; verify the fit against least squares and distinguish training MSE from noise-free prediction error, including a noise-free control.
 
 ## Chapter 2. From one perceptron to networks
 
@@ -81,7 +108,7 @@ Implementation exercises ship with automated checks: shape and value tests, comp
 - **07 — The perceptron:** weighted sums, thresholds, decision boundaries, and the perceptron learning rule.
 - **08 — Linear separability:** AND, OR, XOR, convergence assumptions, and why one perceptron fails.
 - **09 — Logistic regression:** smooth decisions, probabilities, log-odds, and binary cross-entropy derived from Bernoulli likelihood.
-- **10 — Softmax regression:** multiclass logits, softmax, categorical cross-entropy, the log-sum-exp trick, and sanity-checking the initial loss (≈ ln C for C classes).
+- **10 — Softmax regression:** multiclass logits, softmax, categorical cross-entropy, the log-sum-exp trick, and sanity-checking the initial loss (≈ ln C for C classes when predictions are approximately uniform), including the heuristic's assumptions and counterexamples.
 - **11 — Networks of perceptrons:** construct logical functions and combine half-spaces into decision regions.
 - **12 — Universal approximation:** build functions using ReLU pieces; explore width versus depth and approximation error.
 
@@ -94,6 +121,7 @@ Distinguish **representing a function**, **learning it through optimization**, a
 - Implement Newton's method for logistic regression; compare its quadratic convergence with gradient descent and explain why it does not scale to networks.
 - Debug a multiclass classifier whose loss stays at ln K because shuffling decoupled inputs from labels.
 - Investigate: constructed versus trained one-hidden-layer ReLU networks approximating `sin(x)`; how the gap grows with width, and how much seeds differ.
+- Independent mini-capstone: test the initial-loss heuristic across initialization scales and seeds, with uniform-logit and shuffled-label controls; produce a counterexample and state the diagnostic's assumptions. Checkerboard checks include grid lines, intersections, and outer edges with explicit boundary ownership.
 
 ## Chapter 3. MLPs and backpropagation in depth
 
@@ -114,7 +142,8 @@ Distinguish **representing a function**, **learning it through optimization**, a
 - Derive and implement backpropagation for a three-layer MLP with a different activation per layer; pass `gradcheck`.
 - Implement AdamW from scratch and match `torch.optim.AdamW` exactly over 100 steps.
 - Debug three broken MLPs: a missing nonlinearity, softmax applied before `CrossEntropyLoss`, and a layer stored in a plain Python list so its parameters are never registered.
-- Investigate: plot activation and gradient statistics per layer for a 20-layer MLP under three initializations and explain the differences.
+- Investigate: diagnose two failed deep-MLP training runs (exploding activations; vanishing gradients) from per-layer activation and gradient statistics, then fix each by changing its cause.
+- Independent mini-capstone: diagnose an unfamiliar failed run (a custom activation with a subtly wrong backward pass that mimics a learning-rate problem); write a finite-difference gradient verifier, fix the activation, and run one-factor experiments across shared seeds with matched updates, separating the cause from a misleading partial fix.
 
 ## Chapter 4. Training models reliably
 
@@ -287,7 +316,7 @@ Each teaching notebook will contain:
 | --- | --- |
 | Teaching notebook (CPU core + inline exercises) | 2–3 hours |
 | End-of-notebook exercises | 1–2 hours |
-| Chapter problem set | 3–5 hours |
+| Chapter problem set, including independent mini-capstone | 5–7 hours |
 | **[GPU]** scale-up section | 0.5–2 hours, plus run time |
 | Capstone | 10–20 hours |
 
