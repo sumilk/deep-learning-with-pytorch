@@ -4,11 +4,11 @@
 # | | |
 # | --- | --- |
 # | **Prerequisites** | Notebooks 07–12 |
-# | **Covers** | Hand-constructed step networks, second-order optimization of logistic regression, a silent data bug in multiclass training, constructed versus trained ReLU networks |
-# | **Estimated time** | 4–5 hours |
+# | **Covers** | Hand-constructed step networks, second-order optimization of logistic regression, a silent data bug in multiclass training, constructed versus trained ReLU networks, an independent diagnostic study |
+# | **Estimated time** | 5–7 hours |
 # | **Compute** | CPU |
 #
-# These problems combine ideas from the whole chapter. Each has automated checks; problems 2 and 4 also ask for a short written analysis. Attempt each problem before opening its hint.
+# These problems combine ideas from the whole chapter. Each has automated checks; problems 2, 4, and 5 also ask for a short written analysis. Attempt each problem before opening its hint.
 
 # %% [markdown]
 # ## Setup
@@ -55,7 +55,7 @@ plot_dataset(X_board, y_board, title="make_checkerboard(tiles=4)", s=6)
 plt.show()
 
 # %% [markdown]
-# **Your task:** build a network of **step units**, $\operatorname{step}(z) = 1$ if $z > 0$ else $0$, that classifies every point correctly. Use exactly this architecture, so that no training is needed — only reasoning:
+# **Your task:** build a network of **step units**, $\operatorname{step}(z) = 1$ if $z \ge 0$ else $0$, that classifies every point correctly. Use exactly this architecture, so that no training is needed — only reasoning:
 #
 # | Layer | Units | Role |
 # | --- | --- | --- |
@@ -63,16 +63,18 @@ plt.show()
 # | 2 | 2 | An OR unit and a NAND unit |
 # | 3 | 1 | An AND unit: the class |
 #
+# Grid lines belong to the tile on their right/above, matching the generator's floor rule; the outer edge at 1 belongs to the final tile. The non-strict step matters on these boundaries.
+#
 # Store the layers as `board_layers = [(W1, b1), (W2, b2), (W3, b3)]` with `nn.Linear`'s layout: `W1` is `(6, 2)`, `W2` is `(2, 6)`, `W3` is `(1, 2)`. The function below runs them.
 #
 # Plan it in two steps:
 #
-# 1. **Column parity.** Let $s_1, s_2, s_3$ be the outputs of the units for $x_1 > -0.5$, $x_1 > 0$, $x_1 > 0.5$. The column index is $i = s_1 + s_2 + s_3$. Because the thresholds are ordered, $s_1 \ge s_2 \ge s_3$. Show that the column parity $i \bmod 2$ equals the **linear** expression $s_1 - s_2 + s_3$. The same holds for rows.
+# 1. **Column parity.** Let $s_1, s_2, s_3$ be the outputs of the units for $x_1 \ge -0.5$, $x_1 \ge 0$, $x_1 \ge 0.5$. The column index is $i = s_1 + s_2 + s_3$. Because the thresholds are ordered, $s_1 \ge s_2 \ge s_3$. Show that the column parity $i \bmod 2$ equals the **linear** expression $s_1 - s_2 + s_3$. The same holds for rows.
 # 2. **XOR of parities.** The class is $(i + j) \bmod 2 = \operatorname{XOR}(i \bmod 2,\ j \bmod 2)$. Notebook 11 built XOR as AND(OR, NAND). Each of the OR and NAND units reads the two parities — and each parity is a linear combination of layer-1 outputs, so it can be folded into the layer-2 weights.
 
 # %%
 def step(z):
-    return (z > 0).float()
+    return (z >= 0).float()
 
 
 def run_step_network(X, layers):
@@ -83,7 +85,7 @@ def run_step_network(X, layers):
     return h.squeeze(1).long()
 
 # %% [markdown] tags=["hint"]
-# Layer 1: rows `[1, 0]` with biases `0.5, 0, -0.5` (for $x_1 > -0.5$, $x_1 > 0$, $x_1 > 0.5$), then the same with `[0, 1]`. Layer 2: OR of the parities is `step(cx + cy - 0.5)`, so its weights are `[1, -1, 1, 1, -1, 1]` with bias `-0.5`. NAND is `step(-(cx + cy) + 1.5)`. Layer 3: AND is `step(h1 + h2 - 1.5)`.
+# Layer 1: rows `[1, 0]` with biases `0.5, 0, -0.5` (for $x_1 \ge -0.5$, $x_1 \ge 0$, $x_1 \ge 0.5$), then the same with `[0, 1]`. Layer 2: OR of the parities is `step(cx + cy - 0.5)`, so its weights are `[1, -1, 1, 1, -1, 1]` with bias `-0.5`. NAND is `step(-(cx + cy) + 1.5)`. Layer 3: AND is `step(h1 + h2 - 1.5)`.
 
 # %%
 # BEGIN SOLUTION
@@ -106,6 +108,14 @@ for (W, b), shape in zip(board_layers, [(6, 2), (2, 6), (1, 2)]):
 predictions = run_step_network(X_board, board_layers)
 accuracy = (predictions == y_board).float().mean().item()
 check(accuracy == 1.0, f"accuracy is {accuracy:.3f}; every point should be classified correctly")
+# Include grid lines, their intersections, outer edges, interiors, and nearby points.
+coords = torch.tensor([-1.0, -0.75, -0.5001, -0.5, -0.4999, -0.25,
+                       -0.0001, 0.0, 0.0001, 0.25, 0.4999, 0.5, 0.5001, 0.75, 1.0])
+boundary_points = torch.cartesian_prod(coords, coords)
+cells = ((boundary_points + 1) * 2).floor().clamp(0, 3).long()
+expected = cells.sum(dim=1) % 2
+check(torch.equal(run_step_network(boundary_points, board_layers), expected),
+      "checkerboard labels must also agree on grid lines, intersections, and outer edges")
 passed("Problem 1")
 
 # %%
@@ -348,3 +358,116 @@ plt.show()
 # 1. At small widths the best trained network roughly matches the construction (H = 4: 0.18 vs 0.21; H = 8: 0.075 vs 0.070) — training can even place its kinks better than equally spaced knots. As $H$ grows, the gap opens: at $H = 32$ the construction's error is about 0.005, while trained networks reach only 0.018–0.045. The construction follows the $1/H^2$ rate; the trained error falls much more slowly. With $H = 2$ neither does well: three knots at $-\pi, 0, \pi$ give the zero function, an error of 1.
 # 2. A lot. At $H = 4$ one seed reaches 0.18 and the other two get stuck near 0.91; at $H = 32$ the worst seed is 2.5 times worse than the best. The result of training depends on the random initialization, so a fair statement about "a width-$H$ network" must report several seeds (Chapter 4, notebook 26).
 # 3. Representation is an existence statement: good weights exist. This experiment shows that gradient descent, with a fixed budget of steps, does not reliably find them, and the shortfall grows with width. Training is an optimization problem in its own right — initialization, the optimizer, and the learning rate (Chapter 3) decide how much of a network's representational capacity is actually used.
+
+# %% [markdown]
+# ## Problem 5: Independent capstone — can an untrained classifier beat ln K?
+#
+# Test a diagnostic rather than accepting it as a rule. Use a simple balanced dataset: 80 equally spaced inputs in [-1, 1], with label 1 when x > 0. There is no training in this experiment.
+#
+# **Before running:** predict how initial cross-entropy and accuracy vary with initialization scale, and whether one low loss proves leakage. Specify a negative control that breaks the input/label relationship.
+#
+# Implement `initial_metrics(logits, labels)` returning scalar tensors `(mean_cross_entropy, accuracy)`. Verify it independently. Then design and implement the experiment from scratch: choose at least **three nonnegative scales including zero** and **30 seeds**. For each seed create `nn.Linear(1, 2)` after `torch.manual_seed(seed)`; multiply both its initial weight and bias by the scale without training. Compare the real labels with a shuffled copy, using one permutation from a local generator seeded with the same seed. Pair the model parameters across label conditions and scales so those comparisons have a control.
+#
+# Store rows `(scale, seed, shuffled, loss, accuracy)` in a float64 tensor `study2`, where shuffled is 0 or 1. Design plots showing the distribution across seeds and report how often loss falls below ln 2 for each condition. Do not report only the best initialization. Include an explicit counterexample to the claim that a low initial loss necessarily proves a bug, and discuss why this unusually simple dataset limits the conclusion.
+
+# %% [markdown]
+# *Your predictions, controls, scale choices, and plots to produce (write before running):*
+
+# %%
+capstone_X = torch.linspace(-1, 1, 80).unsqueeze(1)  # (80, 1)
+capstone_y = (capstone_X[:, 0] > 0).long()           # balanced (80,)
+
+# %% [markdown] tags=["hint"]
+# Zero logits give uniform predictions and loss ln 2 exactly, for either labeling. Scaling changes confidence, while a random slope may already have the correct direction. Use the same parameters to compare genuine and shuffled labels; only change one factor at a time.
+
+# %%
+def initial_metrics(logits, labels):
+    # BEGIN SOLUTION
+    loss = F.cross_entropy(logits, labels)
+    accuracy = (logits.argmax(dim=1) == labels).double().mean()
+    return loss, accuracy
+    # END SOLUTION
+
+# %% tags=["check"]
+_test_logits = torch.tensor([[1000.0, -1000.0], [-1000.0, 1000.0], [0.0, 0.0]], dtype=torch.float64)
+_test_labels = torch.tensor([0, 0, 1])
+_loss, _accuracy = initial_metrics(_test_logits, _test_labels)
+check_shape(_loss, (), "mean cross-entropy")
+check_shape(_accuracy, (), "accuracy")
+check_close(_loss, (2000 + math.log(2)) / 3, "stable mean loss on extreme logits")
+check_close(_accuracy, 1 / 3, "argmax accuracy (ties choose class 0)")
+_uniform_loss, _ = initial_metrics(torch.zeros(80, 2), capstone_y)
+check_close(_uniform_loss, math.log(2), "uniform baseline")
+_gen = torch.Generator().manual_seed(5)
+for _n, _k in [(1, 2), (17, 4)]:
+    _z = torch.randn(_n, _k, generator=_gen, dtype=torch.float64)
+    _y = torch.randint(_k, (_n,), generator=_gen)
+    _loss, _acc = initial_metrics(_z, _y)
+    _reference = -torch.distributions.Categorical(logits=_z).log_prob(_y).mean()
+    check_close(_loss, _reference, "mean loss vs categorical likelihood")
+    check_close(_acc, (_z.argmax(dim=1) == _y).double().mean(), "accuracy on general logits")
+passed("Capstone metrics")
+
+# %% [markdown] tags=["hint"]
+# Save every seed's two metrics, then aggregate or plot the records. Label permutations must preserve class counts. A spread or histogram is more informative here than a single average. Evaluate under torch.no_grad().
+
+# %%
+# BEGIN SOLUTION
+scales2, seeds2 = [0.0, 0.01, 1.0, 10.0], list(range(60))
+records2 = []
+for seed in seeds2:
+    torch.manual_seed(seed)
+    model = nn.Linear(1, 2)
+    perm = torch.randperm(len(capstone_y), generator=torch.Generator().manual_seed(seed))
+    with torch.no_grad():
+        base_logits = model(capstone_X)
+        for scale in scales2:
+            for shuffled, labels in [(0, capstone_y), (1, capstone_y[perm])]:
+                loss, accuracy = initial_metrics(scale * base_logits, labels)
+                records2.append([scale, seed, shuffled, loss.item(), accuracy.item()])
+study2 = torch.tensor(records2, dtype=torch.float64)
+fig, axes = plt.subplots(1, len(scales2), figsize=(13, 3), sharey=True)
+for ax, scale in zip(axes, scales2):
+    for shuffled, label in [(0, "true"), (1, "shuffled")]:
+        rows = study2[(study2[:, 0] == scale) & (study2[:, 2] == shuffled)]
+        ax.scatter(rows[:, 1], rows[:, 3], s=9, alpha=0.6, label=label)
+        print(f"scale={scale:g}, {label}: accuracy mean {rows[:, 4].mean().item():.3f}, SD {rows[:, 4].std().item():.3f}")
+        print(f"scale={scale:g}, {label}: fraction below ln 2 (tolerance 1e-6) = {(rows[:, 3] < math.log(2) - 1e-6).double().mean().item():.3f}")
+    ax.axhline(math.log(2), color="gray", ls="--")
+    ax.set(xlabel="initialization seed", title=f"Scale {scale:g}")
+axes[0].set_ylabel("initial mean cross-entropy")
+axes[0].legend()
+plt.tight_layout()
+plt.show()
+print("One untrained counterexample:", study2[(study2[:, 0] == 1) & (study2[:, 2] == 0) & (study2[:, 3] < 0.6)][0].tolist())
+# END SOLUTION
+
+# %% tags=["check"]
+check_shape(study2, (len(study2), 5), "study2")
+check(study2.dtype == torch.float64, "store study2 in float64")
+check(bool(torch.isfinite(study2).all()), "all records must be finite")
+_scales, _seeds = study2[:, 0].unique().tolist(), study2[:, 1].unique().tolist()
+check(len(_scales) >= 3 and min(_scales) == 0, "include zero and at least two positive scales")
+check(len(_seeds) >= 30 and all(s >= 0 and s == int(s) for s in _seeds), "use at least 30 nonnegative integer seeds")
+check(len(study2) == len(_scales) * len(_seeds) * 2, "record both label controls for every scale and seed")
+for _seed in _seeds:
+    torch.manual_seed(int(_seed))
+    _model = nn.Linear(1, 2)
+    _perm = torch.randperm(80, generator=torch.Generator().manual_seed(int(_seed)))
+    with torch.no_grad():
+        _base = _model(capstone_X)
+        for _scale in _scales:
+            for _shuffled, _labels in [(0, capstone_y), (1, capstone_y[_perm])]:
+                _rows = study2[(study2[:, 0] == _scale) & (study2[:, 1] == _seed) & (study2[:, 2] == _shuffled)]
+                check(len(_rows) == 1, "record each condition exactly once")
+                _logits = (_scale * _base).double()
+                _loss = -(F.log_softmax(_logits, dim=1)[torch.arange(80), _labels]).mean()
+                _acc = (_logits.argmax(dim=1) == _labels).double().mean()
+                check_close(_rows[0, 3:], torch.stack([_loss, _acc]), "recorded metrics vs independent reference", rtol=1e-5, atol=1e-6)
+passed("Capstone controlled experiment (written analysis still required)")
+
+# %% [markdown]
+# **Report rubric (address every item):** quantify the distributions, identify a counterexample by seed/scale/loss, compare real and shuffled labels, and explain the zero-scale control. State a revised diagnostic with its assumptions, one limitation, and a follow-up experiment. Code checks do not assess the quality of your plots or argument.
+
+# %% [markdown] tags=["solution"]
+# With zero scale both labelings give ln 2 and accuracy 0.5: this verifies the baseline and class balance. Near zero scale probabilities remain nearly uniform, so losses cluster near ln 2. At larger scales a favorable random slope and modest bias can already classify the simple threshold task well; other seeds confidently favor the wrong class and give very large loss. The records and printed counterexample establish that low initial loss is possible without training or leakage. Shuffling preserves class counts but removes the systematic relationship to x; occasional below-baseline shuffled results can still occur by chance. A few favorable runs do not establish that an initialization is generally useful. The valid diagnostic is conditional: approximately uniform predictions imply a loss near ln K; substantial deviations call for inspecting logits, class balance, loss reduction, multiple seeds, and negative controls. They do not by themselves prove leakage. This one-dimensional, balanced task has unusually simple structure; repeat with larger, noisier, higher-dimensional data before drawing practical conclusions. The two controls share parameters, avoiding a confound from redrawing models when changing labels.

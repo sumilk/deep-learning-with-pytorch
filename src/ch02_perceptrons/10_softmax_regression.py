@@ -1134,7 +1134,7 @@ print("buggy P[0] =", P_bug[0].tolist())
 # Optionally add a fourth run whose *inputs* are multiplied by 100 instead.
 
 # %% [markdown] tags=["hint"]
-# With huge weights the logits are in the tens, so most examples are confidently assigned to *some* class — usually the wrong one — and each wrong example costs about the gap between its largest logit and its true-class logit. For the bias: $P_{i0} \approx e^8/(e^8 + 3)$. For the "far below" question: before training, a model cannot know anything about the labels.
+# With huge weights the logits are in the tens, so most examples are confidently assigned to *some* class — usually the wrong one — and each wrong example costs about the gap between its largest logit and its true-class logit. For the bias: $P_{i0} \approx e^8/(e^8 + 3)$. For the "far below" question: distinguish nearly uniform logits from random logits that happen to align with the labels. How much evidence does one initialization provide?
 
 # %%
 def init_small(m):
@@ -1191,7 +1191,7 @@ plt.show()
 #
 # **Training.** The healthy run gets below 0.2 in 41 steps. The biased run needs only 46: a large, consistent gradient on the bias removes most of the bias within a few steps (the curve drops steeply), after which it behaves like the healthy run. The huge-weight run needs 101 steps, more than twice as long, and its curve stays above the others for about 200 steps. The loss is convex, so it does reach the same minimum eventually, but gradient descent must first shrink weights of size ~10 down to size ~3–4, and the gradient $(P - Y)^\top X / N$ is bounded (each entry of $P - Y$ lies in $[-1, 1]$), so it can only move the weights a bounded amount per step. In deep networks the cost is worse: saturated outputs give poor gradients for the earlier layers, and the run may never recover (notebook 18).
 #
-# **What it tells you.** An initial loss far **above** $\ln K$ means the model starts out confidently wrong: initialization too large, inputs not normalized, a bias that favours some classes, or a loss computed on the wrong thing (for example a missing softmax over the right dimension). An initial loss far **below** $\ln K$ should be impossible, since an untrained model knows nothing about the labels (unless the classes are very unbalanced and the bias happens to match their frequencies); it usually means the labels leaked into the inputs or the loss is wrong. Either way, check it before spending compute on training: it costs one forward pass.
+# **What it tells you.** An initial loss far **above** $\ln K$ means the model starts out confidently wrong: initialization too large, inputs not normalized, a bias that favours some classes, or a loss computed on the wrong thing (for example a missing softmax over the right dimension). An initial loss far **below** $\ln K$ is possible: random weights may align with the labels by chance, particularly on a small or simple dataset; class imbalance and matching biases can also lower the loss. The $\ln K$ baseline assumes approximately uniform predicted probabilities, not merely an untrained model. Check the logits and class frequencies, repeat across seeds, and compare with shuffled labels before attributing a low initial loss to leakage or a faulty loss. Chapter 2's independent capstone tests this diagnostic. Either way, check it before spending compute on training: it costs one forward pass.
 
 # %% [markdown]
 # ## Summary and what's next

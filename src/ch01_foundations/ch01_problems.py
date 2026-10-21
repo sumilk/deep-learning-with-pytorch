@@ -4,11 +4,11 @@
 # | | |
 # | --- | --- |
 # | **Prerequisites** | Notebooks 00–06 |
-# | **Covers** | Tensor shapes and views, a custom autograd function, debugging training loops, likelihoods as losses, a complete regression fit |
-# | **Estimated time** | 4–5 hours |
+# | **Covers** | Tensor shapes and views, a custom autograd function, debugging training loops, likelihoods as losses, a complete regression fit, an independent sampling study |
+# | **Estimated time** | 5–7 hours |
 # | **Compute** | CPU. Problem 6 is optional and needs a GPU. |
 #
-# These problems combine ideas from the whole chapter. Each has automated checks; problems 4 and 5 also ask for a short written analysis. Attempt each problem before opening its hint.
+# These problems combine ideas from the whole chapter. Each has automated checks; problems 4, 5, and 7 also ask for a short written analysis. Attempt each problem before opening its hint.
 
 # %% [markdown]
 # ## Setup
@@ -254,6 +254,12 @@ def train_with_optimizer(steps=500, lr=0.1):
         loss.backward()
         optimizer.step()
     return model.weight.item(), model.bias.item()
+
+# %% tags=["check"]
+fitted_w, fitted_b = train_with_optimizer()
+check_close(fitted_w, w_ls, "Problem 3a slope vs least squares", atol=1e-4)
+check_close(fitted_b, b_ls, "Problem 3a bias vs least squares", atol=1e-4)
+passed("Problem 3a")
 
 # %% [markdown]
 # ### 3b. The penalty that does nothing
@@ -537,3 +543,107 @@ else:
     check_close(stable_lse(x_dev).cpu(), stable_lse(x_cpu), f"values on {device.type}", rtol=1e-5, atol=1e-5)
     check_close(x_dev.grad.cpu(), x_cpu.grad, f"gradients on {device.type}", rtol=1e-4, atol=1e-6)
     passed("Problem 6")
+
+# %% [markdown]
+# ## Problem 7: Independent capstone — does more data improve a fit?
+#
+# Design an experiment linking likelihood, least squares, and sampling variability.
+# You choose the sample sizes, noise levels, seeds, plots, and interpretation; there is no supplied experiment loop.
+#
+# **Before running:** predict how increasing sample size or Gaussian noise changes (a) training MSE and (b) error against the noise-free line. Explain why they need not move together.
+#
+# **Protocol:** use the generator below, fit a line with an intercept, and evaluate it on the fixed noise-free grid. Implement `fit_trial(n, sigma, seed)` returning `(theta, train_mse, grid_mse)`, where `theta` is a float64 tensor `(2,)` in slope/intercept order and both MSEs are scalars. You may use manual gradients, autograd, or least squares; verify your answer against least squares. Never use the evaluation targets to fit parameters.
+#
+# Then choose at least **three sample sizes** (all at least 4), **two distinct positive noise levels**, and **five seeds** shared across all conditions. Implement the full experiment, storing rows `(n, sigma, seed, train_mse, grid_mse)` in a float64 tensor `study1`. Plot means and variability across seeds for both errors. Keep the true line and evaluation grid fixed. Include a noise-free control and explain what a single noisy run cannot establish. This is an early look at generalization; Chapter 4 develops evaluation properly.
+
+# %% [markdown]
+# *Your predictions and experimental choices (write before running):*
+
+# %%
+def regression_sample(n, sigma, seed):
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.linspace(-1, 1, n, dtype=torch.float64)
+    y = 2.5 * x - 1 + sigma * torch.randn(n, generator=gen, dtype=torch.float64)
+    return x, y
+
+
+capstone_grid = torch.linspace(-1, 1, 401, dtype=torch.float64)
+capstone_truth = 2.5 * capstone_grid - 1
+
+# %% [markdown] tags=["hint"]
+# Separate data generation, fitting, scoring, and aggregation. A column of ones includes the intercept. Show individual seeds or standard deviations as well as means. Use the zero-noise control to distinguish fitting errors from sampling variability.
+
+# %%
+def fit_trial(n, sigma, seed):
+    # BEGIN SOLUTION
+    x, y = regression_sample(n, sigma, seed)
+    A = torch.stack([x, torch.ones_like(x)], dim=1)
+    theta = torch.linalg.lstsq(A, y).solution
+    train_mse = ((A @ theta - y) ** 2).mean().item()
+    grid_mse = ((theta[0] * capstone_grid + theta[1] - capstone_truth) ** 2).mean().item()
+    return theta, train_mse, grid_mse
+    # END SOLUTION
+
+# %% tags=["check"]
+for _n, _sigma, _seed in [(4, 0.0, 8), (13, 0.2, 9), (71, 1.0, 10)]:
+    _theta, _train, _grid = fit_trial(_n, _sigma, _seed)
+    _x, _y = regression_sample(_n, _sigma, _seed)
+    _A = torch.stack([_x, torch.ones_like(_x)], dim=1)
+    _ref = torch.linalg.lstsq(_A, _y).solution
+    check_shape(_theta, (2,), "fitted parameters")
+    check(_theta.dtype == torch.float64, "fit in float64")
+    check_close(_theta, _ref, "parameters vs least squares", atol=1e-5)
+    check_close(_train, ((_A @ _theta - _y) ** 2).mean().item(), "training MSE")
+    check_close(_grid, ((_theta[0] * capstone_grid + _theta[1] - capstone_truth) ** 2).mean().item(), "noise-free grid MSE")
+passed("Capstone fitting and scoring")
+
+# %% [markdown] tags=["hint"]
+# For each condition and seed, call your fitting function and retain the individual measurements. Do not discard inconvenient seeds. Plot both metrics against sample size separately for each noise level.
+
+# %%
+# BEGIN SOLUTION
+sizes1, noise1, seeds1 = [8, 32, 128], [0.2, 1.0], list(range(10))
+study1 = torch.tensor([
+    [n, sigma, seed, *fit_trial(n, sigma, seed)[1:]]
+    for n in sizes1 for sigma in noise1 for seed in seeds1
+], dtype=torch.float64)
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+for sigma in noise1:
+    for ax, col, title in zip(axes, [3, 4], ["Training MSE", "Noise-free grid MSE"]):
+        groups = [study1[(study1[:, 0] == n) & (study1[:, 1] == sigma), col] for n in sizes1]
+        ax.errorbar(sizes1, [g.mean().item() for g in groups],
+                    yerr=[g.std().item() for g in groups], marker="o", capsize=3,
+                    label=f"σ = {sigma}: mean ± SD")
+        ax.set(xscale="log", xlabel="training examples n", ylabel="MSE", title=title)
+        ax.legend()
+plt.tight_layout()
+plt.show()
+print("Noise-free control (parameters, training MSE, grid MSE):", fit_trial(8, 0.0, 0))
+# END SOLUTION
+
+# %% tags=["check"]
+check_shape(study1, (len(study1), 5), "study1")
+check(study1.dtype == torch.float64, "store study1 in float64")
+check(bool(torch.isfinite(study1).all()), "all recorded conditions and scores must be finite")
+_ns, _sigmas, _seeds = [study1[:, k].unique().tolist() for k in range(3)]
+check(len(_ns) >= 3 and all(n >= 4 and n == int(n) for n in _ns), "use at least three integer sample sizes >= 4")
+check(len(_sigmas) >= 2 and min(_sigmas) > 0, "use at least two positive noise levels")
+check(len(_seeds) >= 5 and all(s >= 0 and s == int(s) for s in _seeds), "use at least five nonnegative integer seeds")
+for _n in _ns:
+    for _sigma in _sigmas:
+        for _seed in _seeds:
+            _rows = study1[(study1[:, 0] == _n) & (study1[:, 1] == _sigma) & (study1[:, 2] == _seed)]
+            check(len(_rows) == 1, "record every condition/seed exactly once")
+            _x, _y = regression_sample(int(_n), _sigma, int(_seed))
+            _A = torch.stack([_x, torch.ones_like(_x)], dim=1)
+            _theta = torch.linalg.lstsq(_A, _y).solution
+            _expected = torch.stack([((_A @ _theta - _y) ** 2).mean(),
+                                     ((_theta[0] * capstone_grid + _theta[1] - capstone_truth) ** 2).mean()])
+            check_close(_rows[0, 3:], _expected, "recorded MSEs vs independent reference", atol=1e-5)
+passed("Capstone experiment records (written analysis still required)")
+
+# %% [markdown]
+# **Report rubric (address every item):** compare predictions with measured means and spread; explain training error versus noise-free error, the noise-free control, and at least one misleading single-seed result. Identify one limitation and propose a follow-up experiment. A passing code check does not assess your explanation or plots.
+
+# %% [markdown] tags=["solution"]
+# One defensible design uses n = 8, 32, 128, σ = 0.2, 1, and ten shared seeds. Noise-free fits recover (2.5, -1) to rounding error, establishing that the fitter works. With noise, training MSE estimates residual noise after fitting two parameters; its expectation is σ²(1 - 2/n), so it need not decrease with n. Noise-free prediction error instead comes from uncertainty in the fitted parameters and decreases roughly as σ²/n. Increasing σ by five multiplies expected squared errors by 25, not five. Individual seeds can reverse the sample-size trend; the plotted SD describes run-to-run variability, not a confidence interval for the mean. The controls isolate fitting error from sampling error, but assume the linear model and Gaussian noise are correct. A useful follow-up replaces some observations with outliers and compares squared-error and absolute-error fits. Other sample sizes and noise levels are valid if the report states the controls and supports its conclusions with measurements.

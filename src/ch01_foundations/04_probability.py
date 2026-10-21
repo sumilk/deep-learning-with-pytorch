@@ -931,7 +931,9 @@ passed("Exercise 3")
 #
 # On a log-log plot, $\log \operatorname{sd} = -\tfrac12 \log n + \text{const}$ is a straight line with slope $-1/2$. Test this:
 #
-# 1. Run the scaffold. It repeats the Exercise 1 experiment for several values of `n`, measures the standard deviation of $\hat{p}$ across repeats, plots it on log-log axes, and fits a straight line.
+# 1. Using only the constants below, implement the experiment yourself: repeat Bernoulli sampling for each `n`, measure the standard deviation of $\hat{p}$ across repeats, plot it against `n` on log-log axes, and fit the slope with least squares. Keep the repeat count and true probability fixed. Record your predicted slope before running.
+# Use the provided `gen` with one `torch.rand(repeats, n, generator=gen, dtype=torch.float64)` draw per size, in order. Store the standard deviations in `measured_sd` and the fitted log-log slope in `slope`, so the check can verify your measurements.
+#
 # 2. Is the measured slope close to $-1/2$? Do the measurements match the theoretical curve?
 # 3. How many flips would you need to get the standard deviation down to 0.01? Write your conclusion below.
 
@@ -944,6 +946,7 @@ repeats = 2_000
 sizes = [10, 30, 100, 300, 1_000, 3_000]
 gen = torch.Generator().manual_seed(0)
 
+# BEGIN SOLUTION
 measured_sd = []
 for n in sizes:
     p_hats = (torch.rand(repeats, n, generator=gen, dtype=torch.float64) < p_true).double().mean(dim=1)  # shape (repeats,)
@@ -966,6 +969,21 @@ plt.show()
 print(f"fitted slope on log-log axes: {slope:.3f}")
 for n, m, t in zip(sizes, measured_sd, theory):
     print(f"n = {n:>5}: measured sd {m:.4f}   theory {t:.4f}   ratio {m / t:.3f}")
+# END SOLUTION
+
+# %% tags=["check"]
+check(len(measured_sd) == len(sizes), "record one standard deviation for each sample size")
+_expected_sd = []
+_gen = torch.Generator().manual_seed(0)
+for _n in sizes:
+    _draws = (torch.rand(repeats, _n, generator=_gen, dtype=torch.float64) < p_true).double()
+    _expected_sd.append(_draws.mean(dim=1).std().item())
+check_close(torch.tensor(measured_sd), torch.tensor(_expected_sd), "measured sampling variability")
+_log_n = torch.tensor(sizes, dtype=torch.float64).log()
+_design = torch.stack([_log_n, torch.ones_like(_log_n)], dim=1)
+_expected_slope = torch.linalg.lstsq(_design, torch.tensor(_expected_sd, dtype=torch.float64).log()).solution[0]
+check_close(slope, _expected_slope.item(), "measured log-log slope")
+passed("Exercise 4 experiment")
 
 # %% [markdown]
 # *Your conclusion:*
